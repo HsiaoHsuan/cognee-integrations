@@ -1,0 +1,6 @@
+node_modules/
+.wrangler/
+__pycache__/
+# Exams built from your own Claude Code history hold real prompts (and can hold secrets).
+eval/exam*.json
+eval/exam*.jsonl

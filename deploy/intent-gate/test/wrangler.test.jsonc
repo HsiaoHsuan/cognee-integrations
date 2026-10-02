@@ -1,0 +1,17 @@
+{
+  // Local-only config for test/integration.mjs. No AI binding (that one is
+  // always remote); Jev is a stub server reached through the typesafe provider.
+  "name": "intent-gate-test",
+  "main": "../src/index.ts",
+  "compatibility_date": "2026-09-30",
+  "durable_objects": {
+    "bindings": [{ "name": "VERDICTS", "class_name": "VerdictStore" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["VerdictStore"] }],
+  "vars": {
+    "DECIDER_PROVIDER": "typesafe",
+    "TYPESAFE_MODEL": "jev-latest",
+    "CONFIDENCE_THRESHOLD": "0.5",
+    "DEFAULT_PROJECT_NODE_SET": "project"
+  }
+}

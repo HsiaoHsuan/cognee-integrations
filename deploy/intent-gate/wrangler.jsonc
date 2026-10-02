@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "intent-gate",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-30",
+  "observability": { "enabled": true },
+
+  // Jev through Workers AI. Unified Billing, not covered by the free allocation.
+  "ai": { "binding": "AI" },
+
+  "durable_objects": {
+    "bindings": [{ "name": "VERDICTS", "class_name": "VerdictStore" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["VerdictStore"] }],
+
+  "vars": {
+    // "cloudflare" = Workers AI binding (no key). "typesafe" = api.typesafe.ai (needs TYPESAFE_API_KEY secret).
+    "DECIDER_PROVIDER": "cloudflare",
+    "DECIDER_MODEL": "typesafe/jev",
+    "TYPESAFE_MODEL": "jev-latest",
+    // Below this confidence the verdict is not trusted and the prompt is kept (fail-open).
+    "CONFIDENCE_THRESHOLD": "0.8",
+    // node_set used for project intents when the caller sends no `project`.
+    "DEFAULT_PROJECT_NODE_SET": "project",
+    // How long a keyed verdict is remembered so other hooks/agents get the same answer.
+    "VERDICT_TTL_SECONDS": "86400"
+  }
+
+  // Secrets (never commit):
+  //   wrangler secret put GATE_TOKEN         <- required; every request must send it as a Bearer token
+  //   wrangler secret put TYPESAFE_API_KEY   <- only when DECIDER_PROVIDER=typesafe
+}

@@ -1,0 +1,9 @@
+{"text": "反之如果刪除段拉到其他操作段就以操作段為主", "project": "ffmpeg", "context": null, "intent": "spec_rule"}
+{"text": "B + 2", "project": "ffmpeg", "context": "版面有兩種做法：A 單頁式、B 分頁式。匯出也有兩種：1 右側面板、2 底部彈出。你想要哪個組合？", "intent": "decision"}
+{"text": "CI 過了就 merge", "project": "joy-app", "context": null, "intent": "command"}
+{"text": "以後 commit 訊息一律用英文，PR 描述用中文", "project": "demo", "context": null, "intent": "preference"}
+{"text": "我們決定不用 Redis，因為部署環境 Zeabur 免費方案沒有，改用 Postgres 的 LISTEN/NOTIFY", "project": "demo", "context": null, "intent": "decision"}
+{"text": "這個專案的 API 都要過 /api/v2 前綴，v1 已經下線", "project": "demo", "context": null, "intent": "project_fact"}
+{"text": "幫我看一下這個 test 為什麼 fail", "project": "demo", "context": null, "intent": "command|question|bug_report"}
+{"text": "哈哈這個好好笑", "project": "demo", "context": null, "intent": "chitchat"}
+{"text": "把第 42 行的變數改名成 userId", "project": "demo", "context": null, "intent": "command"}

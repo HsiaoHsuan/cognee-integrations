@@ -1,0 +1,23 @@
+{
+  "name": "intent-gate",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Shared intent gate: decides whether a user prompt is worth keeping in long-term memory, using TypeSafe Jev.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:integration": "node test/integration.mjs",
+    "test:py": "python3 -m unittest discover -s test/py -v",
+    "check": "npm run typecheck && npm test && npm run test:integration && npm run test:py"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261002.1",
+    "@modelcontextprotocol/sdk": "^1.31.0",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3",
+    "wrangler": "^4.147.0"
+  }
+}
