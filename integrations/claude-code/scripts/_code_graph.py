@@ -80,6 +80,11 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+try:  # sets a non-urllib User-Agent; Cloudflare 1010-blocks Python-urllib on workers.dev
+    import _ua  # noqa: F401
+except ImportError:  # never let a missing helper break a hook
+    pass
+
 # The one line that differs between the claude-code and codex copies.
 _INTEGRATION = "claude-code"
 

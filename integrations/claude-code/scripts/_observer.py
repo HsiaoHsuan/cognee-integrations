@@ -50,6 +50,11 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+try:  # sets a non-urllib User-Agent; Cloudflare 1010-blocks Python-urllib on workers.dev
+    import _ua  # noqa: F401
+except ImportError:  # never let a missing helper break a hook
+    pass
+
 SETTING_ENV = "COGNEE_LLM_OBSERVER"
 #: Set by the shim in every ``claude`` child it spawns; every hook script exits
 #: at once when it sees this, so an observer call can never re-enter the plugin.

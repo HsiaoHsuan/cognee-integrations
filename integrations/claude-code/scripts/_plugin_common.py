@@ -36,6 +36,11 @@ from _logfiles import rotate_if_oversized as _rotate_log_if_oversized
 from _recall_http import DOWN, SLOW, UNKNOWN, classify_transport_exception
 from event_names import event_fields
 
+try:  # sets a non-urllib User-Agent; Cloudflare 1010-blocks Python-urllib on workers.dev
+    import _ua  # noqa: F401
+except ImportError:  # never let a missing helper break a hook
+    pass
+
 # One-time config: ~/.cognee/.env acts like shell exports (setdefault — a real
 # export still wins). Loaded before any env read below or in importers.
 load_env_file()

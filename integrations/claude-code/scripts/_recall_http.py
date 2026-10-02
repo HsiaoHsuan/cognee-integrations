@@ -37,6 +37,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+try:  # sets a non-urllib User-Agent; Cloudflare 1010-blocks Python-urllib on workers.dev
+    import _ua  # noqa: F401
+except ImportError:  # never let a missing helper break a hook
+    pass
+
 UNREACHABLE = "UNREACHABLE"
 
 # Transport-exception verdicts (classify_transport_exception). Only DOWN is

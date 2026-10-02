@@ -267,6 +267,11 @@ def _cloud_http_request(
     import urllib.parse
     import urllib.request
 
+    try:  # sets a non-urllib User-Agent; Cloudflare 1010-blocks Python-urllib on workers.dev
+        import _ua  # noqa: F401
+    except ImportError:  # never let a missing helper break a hook
+        pass
+
     from _plugin_common import _https_context, urlopen_following_307
 
     headers: dict[str, str] = {}

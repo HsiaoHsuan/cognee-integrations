@@ -26,6 +26,11 @@ import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
 
+try:  # sets a non-urllib User-Agent; Cloudflare 1010-blocks Python-urllib on workers.dev
+    import _ua  # noqa: F401
+except ImportError:  # never let a missing helper break a hook
+    pass
+
 # Add scripts dir to path for config import
 sys.path.insert(0, os.path.dirname(__file__))
 from _logfiles import console_capture_tail as _console_capture_tail

@@ -23,6 +23,11 @@ import time
 import urllib.error
 import urllib.request
 
+try:  # sets a non-urllib User-Agent; Cloudflare 1010-blocks Python-urllib on workers.dev
+    import _ua  # noqa: F401
+except ImportError:  # never let a missing helper break a hook
+    pass
+
 # Ensure the scripts directory is on sys.path so sibling modules resolve.
 _SCRIPTS_DIR = str(pathlib.Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
