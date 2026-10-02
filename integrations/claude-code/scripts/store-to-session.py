@@ -328,6 +328,29 @@ async def _store_assistant_stop(payload: dict) -> None:
     )
     pending = pop_pending_prompt(session_id, turn_id=str(payload.get("turn_id") or ""))
 
+    # The intent gate judged this turn's prompt as not worth keeping (a one-off
+    # command, an acknowledgement). Skip the whole QA row: storing the answer
+    # under an empty question would keep the noise and lose its cause.
+    gate = pending.get("gate") or {}
+    if gate:
+        import _intent_gate
+
+        # A parked prompt can outlive its own turn (an interrupted turn never
+        # reaches this pop). Its verdict is honoured only for the turn it was
+        # made for; otherwise this turn is stored the way it always was.
+        turn = _intent_gate.turn_key(payload)
+        if not turn or gate.get("turn") != turn:
+            hook_log("stop_ignored_stale_gate", {"choice": gate.get("choice")})
+            gate = {}
+    # The gate judges only the prompt; for these the value is in the answer
+    # (the cause found, the fix made), so dropping the turn would lose it.
+    if gate.get("save") is False and gate.get("choice") in ("question", "bug_report"):
+        hook_log("stop_kept_answer_bearing_turn", {"choice": gate.get("choice")})
+        gate = {}
+    if gate.get("save") is False:
+        hook_log("stop_dropped_by_intent_gate", {"choice": gate.get("choice"), "chars": len(msg)})
+        return
+
     # Codex intentionally differs from Claude here: store one paired
     # prompt/answer row so Cognee's filesystem session cache does not get
     # separate question-only and answer-only QA entries for the same turn.
@@ -337,6 +360,8 @@ async def _store_assistant_stop(payload: dict) -> None:
         "answer": msg,
         "context": redact(pending.get("context", "")),
     }
+    if gate.get("node_set"):
+        entry["node_set"] = [str(gate["node_set"])]
 
     if not server_usable(runtime.get("base_url", "")):
         # Server unreachable (stale marker AND a failed probe): buffer the

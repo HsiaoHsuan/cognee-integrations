@@ -145,6 +145,10 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:improve_incomplete_drain` | `improve.incomplete_drain` |
 | `hook:improve_state_write_failed` | `improve.state_write_failed` |
 | `hook:improve_unsupported` | `improve.unsupported` |
+| `hook:intent_gate_exception` | `intent_gate.exception` |
+| `hook:intent_gate_failed` | `intent_gate.failed` |
+| `hook:intent_gate_fallback` | `intent_gate.fallback` |
+| `hook:intent_gate_unconfigured` | `intent_gate.unconfigured` |
 | `hook:invalid_payload_json` | `io.payload_json` |
 | `hook:json_load_failed` | `json.load_failed` |
 | `hook:json_write_failed` | `json.write_failed` |
@@ -190,6 +194,8 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:precompact_sync_defer_failed` | `precompact.sync_defer_failed` |
 | `hook:precompact_sync_deferred` | `precompact.sync_deferred` |
 | `hook:project_memory_prepared` | `project.memory_prepared` |
+| `hook:prompt_dropped` | `prompt.dropped` |
+| `hook:prompt_judged` | `prompt.judged` |
 | `hook:prompt_missing_session_key` | `prompt.missing_session_key` |
 | `hook:prompt_pending` | `prompt.pending` |
 | `hook:prompt_run_exception` | `prompt.run_exception` |
@@ -249,6 +255,9 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:statusline_configured` | `statusline.configured` |
 | `hook:statusline_setup_failed` | `statusline.setup_failed` |
 | `hook:statusline_setup_skipped` | `statusline.setup_skipped` |
+| `hook:stop_dropped_by_intent_gate` | `stop.dropped_by_intent_gate` |
+| `hook:stop_ignored_stale_gate` | `stop.ignored_stale_gate` |
+| `hook:stop_kept_answer_bearing_turn` | `stop.kept_answer_bearing_turn` |
 | `hook:stop_store_error` | `stop.store_error` |
 | `hook:stop_stored` | `stop.stored` |
 | `hook:store_buffered_after_error` | `store.buffered_after_error` |

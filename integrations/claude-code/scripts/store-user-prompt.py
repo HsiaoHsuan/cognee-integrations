@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 from _logfiles import rotate_if_oversized as _rotate_log_if_oversized
 from _plugin_common import (
+    annotate_pending_prompt,
     bump_save_counter,
     drain_warmup_entries,
     get_session_key,
@@ -132,6 +133,46 @@ def _prompt_context(payload: dict) -> str:
     return json.dumps({k: v for k, v in context.items() if v}, default=str)
 
 
+def _judge_prompt(prompt: str, payload: dict) -> dict | None:
+    """Ask the intent gate about this prompt. None when the gate is off.
+
+    Returns what the Stop hook needs: whether to keep the turn, which turn the
+    verdict belongs to, and a node set only when the gate picked one other than
+    this project's own (a preference goes to ``user_context``). Never raises and
+    never drops on failure: the client answers ``save=True`` whenever the gate
+    cannot be trusted.
+    """
+    import _intent_gate
+    from _capture_policy import redact
+
+    if not _intent_gate.judge_enabled():
+        return None
+    try:
+        project = os.path.basename(str(payload.get("cwd") or os.getcwd()).rstrip("/\\")) or None
+        context = _intent_gate.last_assistant_text(payload.get("transcript_path"))
+        turn = _intent_gate.turn_key(payload)
+        verdict = _intent_gate.judge(
+            prompt,
+            context=redact(context) if context else None,
+            project=project,
+            key=turn,
+            log=hook_log,
+        )
+    except Exception as exc:
+        hook_log("intent_gate_exception", {"error": str(exc)[:200]})
+        return None
+    node_set = verdict.get("node_set")
+    gate = {
+        "save": bool(verdict.get("save")),
+        "choice": verdict.get("choice"),
+        "source": verdict.get("source"),
+        "turn": turn,
+        "node_set": node_set if verdict.get("save") and node_set and node_set != project else None,
+    }
+    hook_log("prompt_judged", {**gate, "confidence": verdict.get("confidence")})
+    return gate
+
+
 async def _store(prompt: str, payload: dict):
     from _capture_policy import capture_enabled, redact
 
@@ -171,9 +212,20 @@ async def _store(prompt: str, payload: dict):
         turn_id=str(payload.get("turn_id") or ""),
         context=_prompt_context(payload),
     )
-    hook_log("prompt_pending", {"chars": len(prompt), "turn_id": payload.get("turn_id")})
-    notify(f"user prompt pending ({len(prompt)} chars)")
-    bump_save_counter(session_id, "prompt")
+    # Parked first, judged second: if Stop arrives before the verdict, the turn
+    # is stored exactly as it was before the gate existed.
+    gate = _judge_prompt(safe_prompt, payload)
+    if gate is not None:
+        annotate_pending_prompt(
+            session_id, gate, turn_id=str(payload.get("turn_id") or ""), prompt=safe_prompt
+        )
+    if gate is not None and not gate["save"]:
+        hook_log("prompt_dropped", {"chars": len(prompt), "choice": gate["choice"]})
+        notify(f"user prompt not kept ({gate['choice']})")
+    else:
+        hook_log("prompt_pending", {"chars": len(prompt), "turn_id": payload.get("turn_id")})
+        notify(f"user prompt pending ({len(prompt)} chars)")
+        bump_save_counter(session_id, "prompt")
 
     # Replay any warmup-buffered entries. This hook is the async sibling of
     # session-context-lookup on the same UserPromptSubmit event — identical

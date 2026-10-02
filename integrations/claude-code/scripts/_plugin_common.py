@@ -1736,6 +1736,33 @@ def remember_pending_prompt(
     _write_json_file(_pending_file(session_id), data)
 
 
+def annotate_pending_prompt(
+    session_id: str, gate: dict, *, turn_id: str = "", prompt: str = ""
+) -> bool:
+    """Attach the intent gate's verdict to the prompt already parked for this turn.
+
+    The prompt is parked first and judged second, so a Stop hook that outruns
+    the judge still finds the prompt and stores the turn as it always did. The
+    verdict is attached only while that same prompt is still pending: it never
+    resurrects an entry Stop already consumed, and never lands on a newer
+    prompt. Returns True when it was attached.
+    """
+    if not session_id or not isinstance(gate, dict):
+        return False
+    pending_path = _pending_file(session_id)
+    data = _load_json_file(pending_path)
+    prompt = _strip_surrogates(prompt)[:8000]
+    attached = False
+    for key in dict.fromkeys(_pending_keys(session_id, turn_id)):
+        entry = data.get(key)
+        if isinstance(entry, dict) and entry.get("prompt") == prompt:
+            entry["gate"] = gate
+            attached = True
+    if attached:
+        _write_json_file(pending_path, data)
+    return attached
+
+
 def pop_pending_prompt(session_id: str, *, turn_id: str = "") -> dict:
     """Return and remove the prompt saved for this Codex turn."""
     if not session_id:
@@ -1759,10 +1786,13 @@ def pop_pending_prompt(session_id: str, *, turn_id: str = "") -> dict:
             hook_log("pending_unlink_failed", {"path": str(pending_path), "error": str(exc)[:200]})
     if not isinstance(entry, dict):
         return {"prompt": "", "context": ""}
-    return {
+    popped = {
         "prompt": str(entry.get("prompt") or ""),
         "context": str(entry.get("context") or ""),
     }
+    if isinstance(entry.get("gate"), dict):
+        popped["gate"] = entry["gate"]
+    return popped
 
 
 def _auto_improve_threshold() -> int:
@@ -4624,8 +4654,14 @@ def remember_entry_via_http(
     if parse_dataset_id(dataset):
         require_typed_dataset_id_support()
     entry = _sanitize_value(entry)
+    # An entry may name its own node set (the intent gate files preferences
+    # under a shared one). It is honoured only where project node sets are
+    # already verified for this session; anywhere else it is removed rather
+    # than sent to a backend that may not accept the field.
+    own_node_set = entry.get("node_set")
+    entry = {k: v for k, v in entry.items() if k != "node_set"}
     if target.get("node_set") and entry.get("type") in ("qa", "trace"):
-        entry = {**entry, "node_set": target["node_set"]}
+        entry = {**entry, "node_set": own_node_set or target["node_set"]}
     # The canonical UUID under shared memory (explicit, or resolved from the
     # launch record) wins: a name only resolves among datasets the caller owns.
     # Otherwise a UUID-shaped dataset is sent as an id and a name as a name.
