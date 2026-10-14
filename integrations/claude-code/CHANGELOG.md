@@ -10,7 +10,7 @@ Code only offers an update when that string changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.6.6-distill.1]
+## [1.6.6-fork.1]
 
 ### Changed
 - **Only distilled memories reach long-term memory.** At idle and at session end
