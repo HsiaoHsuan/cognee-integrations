@@ -1,0 +1,91 @@
+{
+  "spec_rule": {
+    "what": "A product rule, UI spec, or how a feature should behave",
+    "not_for": "reporting that something is broken right now (bug_report)",
+    "examples": [
+      "拖曳到時間軸外面就取消，不要刪掉片段",
+      "Empty search results should show the last query, not a blank page"
+    ]
+  },
+  "preference": {
+    "what": "A standing personal preference or way of working that applies to all future work",
+    "not_for": "an instruction for the current task, even a conditional one (command)",
+    "examples": [
+      "以後回覆一律用繁體中文",
+      "From now on, after every change always run the linter"
+    ]
+  },
+  "decision": {
+    "what": "A lasting choice of approach, tool, library, name, layout, data store or architecture, including one made by picking an option the assistant offered",
+    "not_for": "picking only what to look at or do next in this conversation, such as which error to inspect first or whether to also do a side task now (choice_reply)",
+    "examples": [
+      "我們決定用 SQLite，不另外架資料庫",
+      "B (reply to: 版面要 A 單頁式還是 B 分頁式？)"
+    ]
+  },
+  "project_fact": {
+    "what": "A fact, constraint, or environment detail about the project",
+    "not_for": "a rule for how the product should behave (spec_rule)",
+    "examples": [
+      "部署在 Zeabur 免費方案，沒有 Redis",
+      "The API only accepts UTC timestamps"
+    ]
+  },
+  "feature_req": {
+    "what": "A feature or behavior the user wants added to or changed in the product",
+    "not_for": "a one-off operational ask such as run the tests or deploy, even when phrased politely (command)",
+    "examples": [
+      "希望匯出可以選解析度",
+      "可以讓匯出按鈕支援 PNG 嗎"
+    ]
+  },
+  "bug_report": {
+    "what": "Reports that something is broken or behaves wrongly",
+    "not_for": "a rule about how it should work (spec_rule)",
+    "examples": [
+      "匯出之後檔案是空的",
+      "The login page crashes on Safari"
+    ]
+  },
+  "command": {
+    "what": "A one-off operational instruction for the task at hand (push, merge, deploy, run X, edit line N), including conditional and politely phrased ones",
+    "not_for": "a standing rule for all future work (preference)",
+    "examples": [
+      "測試過了就 push",
+      "可以幫我 rebase 一下嗎",
+      "deploy it"
+    ]
+  },
+  "question": {
+    "what": "Asks for information or an explanation",
+    "not_for": "asking for a product change (feature_req) or reporting breakage (bug_report)",
+    "examples": [
+      "這個 hook 是什麼時候觸發的？",
+      "Why is the build slow?"
+    ]
+  },
+  "choice_reply": {
+    "what": "Picks what to look at or do next in this conversation from options the assistant offered",
+    "not_for": "picking a tool, library, name, layout, data store or architecture, or anything that changes what the product or code will be (decision)",
+    "examples": [
+      "先看 B (reply to: 要先看 A 單元測試的錯還是 B 整合測試的 log？)",
+      "第一個 (reply to: 先修 A 逾時問題，或 B 錯字？)"
+    ]
+  },
+  "ack": {
+    "what": "A bare acknowledgement that adds nothing",
+    "not_for": "agreeing to a proposed product change (decision)",
+    "examples": [
+      "ok",
+      "收到"
+    ]
+  },
+  "chitchat": {
+    "what": "Small talk",
+    "not_for": "anything about the work",
+    "examples": [
+      "週末要去爬山",
+      "哈哈太好笑了"
+    ]
+  }
+}

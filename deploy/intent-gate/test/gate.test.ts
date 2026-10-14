@@ -41,7 +41,22 @@ function deps(callJev: JevCall, extra: Partial<GateDeps> = {}): GateDeps {
 describe("rule layer", () => {
   it.each(["好", "繼續", "ok", "OK!", "好的。", "lgtm", "謝謝"])("treats %s as an acknowledgement", (t) => {
     expect(ruleVerdict(t)).toBe("ack");
+    expect(ruleVerdict(t, "   ")).toBe("ack");
+  });
+
+  it.each(["繼續", "continue", "謝謝", "thanks", "go", "lgtm"])("treats %s as an acknowledgement even after a question", (t) => {
     expect(ruleVerdict(t, "要改用 Postgres 嗎？")).toBe("ack");
+  });
+
+  it.each(["好", "ok", "OK!", "好的。", "嗯", "okay"])("hands %s to the model when the previous reply ends with a question", (t) => {
+    expect(ruleVerdict(t, "要改用 Postgres 嗎？")).toBeNull();
+    expect(ruleVerdict(t, "Should I switch to Postgres? ")).toBeNull();
+    expect(ruleVerdict(t, "要先看前端還是後端?")).toBeNull();
+  });
+
+  it.each(["好", "ok", "好的。", "嗯"])("keeps %s an acknowledgement when the previous reply is not a question", (t) => {
+    expect(ruleVerdict(t, "已經改好了，測試也過了。")).toBe("ack");
+    expect(ruleVerdict(t, "要改用 Postgres 嗎？我先跑測試。")).toBe("ack");
   });
 
   it.each(["no", "No.", "yes", "y", "對", "是", "不是", "不要", "不用！"])("treats a bare %s as an acknowledgement when nothing was asked", (t) => {
@@ -69,6 +84,14 @@ describe("rule layer", () => {
 
   it.each(["B + 2", "CI 過了就 merge", "好，但是匯出改成底部彈出", "手機版的"])("hands %s to the model", (t) => {
     expect(ruleVerdict(t)).toBeNull();
+  });
+
+  it("asks Jev about a bare 好 that answers a question, with the question as context", async () => {
+    const callJev = vi.fn(async () => jevResponse("decision"));
+    const { output } = await judge({ text: "好", context: "要改用 Postgres 嗎？", project: "demo" }, deps(callJev));
+    expect(output).toMatchObject({ save: true, choice: "decision", source: "jev" });
+    expect(callJev).toHaveBeenCalledTimes(1);
+    expect((callJev.mock.calls[0] as unknown as [ReturnType<typeof buildRequest>])[0].state.previous_assistant_reply).toBe("要改用 Postgres 嗎？");
   });
 
   it("asks Jev about a yes/no that answers a question", async () => {

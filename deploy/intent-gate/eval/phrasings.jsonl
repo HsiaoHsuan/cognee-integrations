@@ -52,6 +52,9 @@
 {"text": "不要", "project": "demo", "context": "要我順便把所有 any 型別改成 unknown 嗎？", "intent": "choice_reply|command"}
 {"text": "option 1", "project": "demo", "context": "Option 1: show the diff now. Option 2: run the tests first.", "intent": "choice_reply"}
 {"text": "好", "project": "demo", "context": null, "intent": "ack"}
+{"text": "好", "project": "demo", "context": "目前用 Redis 做 pub/sub，但 Zeabur 免費方案沒有 Redis。要改用 Postgres 的 LISTEN/NOTIFY 嗎？", "intent": "decision"}
+{"text": "好", "project": "demo", "context": "已經把匯出按鈕移到右上角，測試也都過了。", "intent": "ack"}
+{"text": "ok", "project": "demo", "context": "錯誤可能在前端的表單驗證，也可能在後端的 API。要先看前端還是後端？", "intent": "choice_reply"}
 {"text": "繼續", "project": "demo", "context": null, "intent": "ack"}
 {"text": "OK!", "project": "demo", "context": null, "intent": "ack"}
 {"text": "lgtm", "project": "demo", "context": null, "intent": "ack"}
