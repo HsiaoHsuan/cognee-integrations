@@ -33,12 +33,12 @@ from _intent_gate import DROP_INTENTS, INTENTS, SAVE_INTENTS  # noqa: E402
 
 DESCRIPTIONS = {
     "spec_rule": "Product rule, UI spec, or how a feature should behave",
-    "preference": "Durable personal preference or standing way of working, including workflow rules such as 'after X, always do Y'",
+    "preference": "Durable personal preference or standing way of working that applies to all future work, including workflow rules such as 'from now on, after X always do Y'; not an instruction for the task at hand",
     "decision": "A lasting choice of approach, tool, technology, name, or architecture, including one made by picking an option the assistant offered",
     "project_fact": "Project fact, constraint, or environment detail",
     "feature_req": "A feature or behavior the user wants added or changed in the product, including requests phrased as 'can you make X...' or '可以...'",
     "bug_report": "Reports that something is broken, no lasting rule",
-    "command": "One-off operational instruction with no lasting product meaning (push, merge, deploy, run X, edit line N)",
+    "command": "One-off operational instruction with no lasting product meaning (push, merge, deploy, run X, edit line N), including conditional ones for the task at hand such as 'merge once CI passes'",
     "question": "Asks for information or an explanation without requesting a product change",
     "choice_reply": "Picks among options the assistant offered when the pick is only a conversational step; if the picked option is a lasting choice (tool, name, architecture, workflow), use decision instead",
     "ack": "Acknowledgement such as ok / continue",
