@@ -292,3 +292,14 @@ def test_multipart_repeats_list_fields(suite, isolated_modules):
 def test_model_from_env_falls_back_when_unusable(distill, monkeypatch, value, expected):
     monkeypatch.setenv("COGNEE_DISTILL_MODEL", value)
     assert distill._model() == expected
+
+
+def test_a_new_transcript_is_read_from_the_start(distill, tmp_path):
+    distill.record_transcript("sess", str(tmp_path / "a.jsonl"), str(tmp_path))
+    state = distill._load("sess")
+    state.update(turns_done=37, size=1234, kept=[{"text": "已存的一條"}])
+    distill._save("sess", state)
+    distill.record_transcript("sess", str(tmp_path / "b.jsonl"), str(tmp_path))
+    state = distill._load("sess")
+    assert "turns_done" not in state and "size" not in state
+    assert state["kept"] == [{"text": "已存的一條"}]

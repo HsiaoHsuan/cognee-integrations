@@ -638,6 +638,12 @@ def record_transcript(session_id: str, transcript_path: str, cwd: str) -> None:
     state = _load(session_id)
     if state.get("transcript") == transcript_path and state.get("cwd") == cwd:
         return
+    if state.get("transcript") and state["transcript"] != transcript_path:
+        # A new conversation under the same Cognee session (/clear with a
+        # pinned COGNEE_SESSION_ID): its turns are counted from 1 again. What
+        # was kept stays, so nothing is written twice.
+        state.pop("turns_done", None)
+        state.pop("size", None)
     state.update(transcript=transcript_path, cwd=cwd)
     _save(session_id, state)
 
