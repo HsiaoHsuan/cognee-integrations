@@ -260,6 +260,18 @@ def result(intent, choice, save, source="jev", conf=0.9, raw=None, raw_conf=None
     }
 
 
+class CriteriaTest(unittest.TestCase):
+    def test_haiku_baseline_reads_the_same_criteria_as_the_worker(self):
+        """eval/run_exam.py keeps its own copy for the haiku baseline; it must match src/jev.ts."""
+        import re
+
+        source = (ROOT / "src" / "jev.ts").read_text(encoding="utf-8")
+        block = source[source.index("export const CRITERIA"):source.index("};", source.index("export const CRITERIA"))]
+        worker = dict(re.findall(r'^\s+(\w+): "(.*)",?$', block, flags=re.M))
+        self.assertEqual(set(worker), set(intent_gate.INTENTS))
+        self.assertEqual(worker, run_exam.DESCRIPTIONS)
+
+
 class ScoringTest(unittest.TestCase):
     def report(self, results):
         buf = io.StringIO()
