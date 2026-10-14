@@ -179,7 +179,11 @@ def _verdict_problem(verdict) -> str:
     if verdict.get("source") not in ("rule", "jev", "fallback"):
         return "unknown source"
     confidence = verdict.get("confidence")
-    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not 0 <= confidence <= 1:
+    if (
+        isinstance(confidence, bool)
+        or not isinstance(confidence, (int, float))
+        or not 0 <= confidence <= 1
+    ):
         return "confidence out of range"
     node_set = verdict.get("node_set")
     if verdict["save"]:

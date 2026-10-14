@@ -18,8 +18,20 @@ import sys
 import pytest
 
 DROP = {"save": False, "choice": "command", "confidence": 0.93, "node_set": None, "source": "jev"}
-KEEP = {"save": True, "choice": "spec_rule", "confidence": 0.86, "node_set": "repo", "source": "jev"}
-PREFERENCE = {"save": True, "choice": "preference", "confidence": 0.9, "node_set": "user_context", "source": "jev"}
+KEEP = {
+    "save": True,
+    "choice": "spec_rule",
+    "confidence": 0.86,
+    "node_set": "repo",
+    "source": "jev",
+}
+PREFERENCE = {
+    "save": True,
+    "choice": "preference",
+    "confidence": 0.9,
+    "node_set": "user_context",
+    "source": "jev",
+}
 
 
 @pytest.fixture(autouse=True)
@@ -76,7 +88,9 @@ def sent(pc, monkeypatch):
     pm = sys.modules.get("_project_memory") or __import__("_project_memory")
     monkeypatch.setattr(pm, "route", lambda dataset, session_id: dict(route))
     monkeypatch.setattr(pc, "dataset_id_for", lambda dataset: None)
-    monkeypatch.setattr(pc, "_json_http_request", lambda path, payload, **k: posted.append(payload) or {})
+    monkeypatch.setattr(
+        pc, "_json_http_request", lambda path, payload, **k: posted.append(payload) or {}
+    )
     return posted, route
 
 
@@ -114,13 +128,19 @@ def prompt_hook(suite, hook_module, monkeypatch, closed_port_url, tmp_path):
     monkeypatch.setenv("COGNEE_IDLE_DISABLED", "1")
     module = hook_module(suite, "store-user-prompt.py")
     events: list[tuple] = []
-    monkeypatch.setattr(module, "hook_log", lambda event, detail=None: events.append((event, detail)))
+    monkeypatch.setattr(
+        module, "hook_log", lambda event, detail=None: events.append((event, detail))
+    )
     monkeypatch.setattr(module, "_load_session", lambda: ("s1", "ds", "", ""))
     monkeypatch.setattr(module, "server_usable", lambda *a, **k: False)
     monkeypatch.setattr(module, "notify", lambda *a, **k: None)
     counted: list[str] = []
-    monkeypatch.setattr(module, "bump_save_counter", lambda session, kind, **k: counted.append(kind))
-    gate = sys.modules["_intent_gate"] if "_intent_gate" in sys.modules else __import__("_intent_gate")
+    monkeypatch.setattr(
+        module, "bump_save_counter", lambda session, kind, **k: counted.append(kind)
+    )
+    gate = (
+        sys.modules["_intent_gate"] if "_intent_gate" in sys.modules else __import__("_intent_gate")
+    )
     module.events, module.counted, module.gate_client = events, counted, gate
     module.payload = {"cwd": str(tmp_path / "repo"), "session_id": "sess", "prompt_id": "p1"}
     return module
@@ -132,7 +152,9 @@ def _pending(module) -> dict:
 
 def test_gate_off_changes_nothing(prompt_hook, monkeypatch):
     monkeypatch.delenv("COGNEE_CAPTURE_JUDGE", raising=False)
-    monkeypatch.setattr(prompt_hook.gate_client, "judge", lambda *a, **k: pytest.fail("gate must not be called"))
+    monkeypatch.setattr(
+        prompt_hook.gate_client, "judge", lambda *a, **k: pytest.fail("gate must not be called")
+    )
     asyncio.run(prompt_hook._store("CI 過了就 merge", prompt_hook.payload))
     assert set(_pending(prompt_hook)) == {"prompt", "context"}
     assert prompt_hook.counted == ["prompt"]
@@ -153,15 +175,21 @@ def test_dropped_prompt_is_marked_and_not_counted(prompt_hook, monkeypatch):
     assert pending["gate"]["save"] is False and pending["gate"]["choice"] == "command"
     assert pending["gate"]["turn"] == "sess:p1", "the verdict names the turn it was made for"
     assert prompt_hook.counted == []
-    assert seen["text"] == "CI 過了就 merge" and seen["project"] == "repo" and seen["key"] == "sess:p1"
+    assert (
+        seen["text"] == "CI 過了就 merge" and seen["project"] == "repo" and seen["key"] == "sess:p1"
+    )
 
 
 def test_kept_project_prompt_uses_the_default_route(prompt_hook, monkeypatch):
     monkeypatch.setenv("COGNEE_CAPTURE_JUDGE", "true")
     monkeypatch.setattr(prompt_hook.gate_client, "judge", lambda *a, **k: dict(KEEP))
-    asyncio.run(prompt_hook._store("反之如果刪除段拉到其他操作段就以操作段為主", prompt_hook.payload))
+    asyncio.run(
+        prompt_hook._store("反之如果刪除段拉到其他操作段就以操作段為主", prompt_hook.payload)
+    )
     gate = _pending(prompt_hook)["gate"]
-    assert gate["save"] is True and gate["node_set"] is None, "the project's own node set is not an override"
+    assert gate["save"] is True and gate["node_set"] is None, (
+        "the project's own node set is not an override"
+    )
     assert prompt_hook.counted == ["prompt"]
 
 
@@ -200,13 +228,24 @@ def test_previous_assistant_reply_is_sent_as_context(prompt_hook, monkeypatch, t
     transcript = tmp_path / "t.jsonl"
     rows = [
         {"type": "user", "message": {"content": "排版怎麼做"}},
-        {"type": "assistant", "message": {"content": [{"type": "text", "text": "A 單頁式還是 B 分頁式？"}]}},
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "A 單頁式還是 B 分頁式？"}]},
+        },
         {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read"}]}},
     ]
-    transcript.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n{partial", encoding="utf-8")
+    transcript.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n{partial", encoding="utf-8"
+    )
     seen: dict = {}
-    monkeypatch.setattr(prompt_hook.gate_client, "judge", lambda text, **k: seen.update(k) or dict(DROP))
-    asyncio.run(prompt_hook._store("B + 2 就好", {**prompt_hook.payload, "transcript_path": str(transcript)}))
+    monkeypatch.setattr(
+        prompt_hook.gate_client, "judge", lambda text, **k: seen.update(k) or dict(DROP)
+    )
+    asyncio.run(
+        prompt_hook._store(
+            "B + 2 就好", {**prompt_hook.payload, "transcript_path": str(transcript)}
+        )
+    )
     assert seen["context"] == "A 單頁式還是 B 分頁式？"
 
 
@@ -222,7 +261,9 @@ def stop_hook(suite, hook_module, monkeypatch, closed_port_url):
     monkeypatch.setattr(module, "_load_session", lambda: ("s1", "ds", ""))
     monkeypatch.setattr(module, "server_usable", lambda *a, **k: False)
     buffered: list[dict] = []
-    monkeypatch.setattr(module, "append_warmup_entry", lambda dataset, session, entry, **k: buffered.append(entry))
+    monkeypatch.setattr(
+        module, "append_warmup_entry", lambda dataset, session, entry, **k: buffered.append(entry)
+    )
     monkeypatch.setattr(module, "bump_save_counter", lambda *a, **k: None)
     module.buffered = buffered
     module.pc = sys.modules["_plugin_common"]
@@ -241,23 +282,44 @@ def _stop(module, prompt: str, gate: dict | None, payload: dict = STOP_PAYLOAD) 
 
 
 def test_dropped_turn_stores_no_qa_row(stop_hook):
-    assert _stop(stop_hook, "CI 過了就 merge", {"save": False, "choice": "command", "node_set": None}) == []
+    assert (
+        _stop(stop_hook, "CI 過了就 merge", {"save": False, "choice": "command", "node_set": None})
+        == []
+    )
     assert not stop_hook.pc._pending_file("s1").exists(), "the parked prompt is still consumed"
 
 
 @pytest.mark.parametrize("choice", ["question", "bug_report"])
 def test_answer_bearing_drop_intents_keep_the_turn(stop_hook, choice):
-    (entry,) = _stop(stop_hook, "為什麼拉取段之後就點不到了", {"save": False, "choice": choice, "node_set": None})
-    assert entry["question"].startswith("為什麼") and entry["answer"] == "done." and "node_set" not in entry
+    (entry,) = _stop(
+        stop_hook, "為什麼拉取段之後就點不到了", {"save": False, "choice": choice, "node_set": None}
+    )
+    assert (
+        entry["question"].startswith("為什麼")
+        and entry["answer"] == "done."
+        and "node_set" not in entry
+    )
 
 
 def test_kept_turn_is_stored_as_before(stop_hook):
-    (entry,) = _stop(stop_hook, "反之如果刪除段拉到其他操作段就以操作段為主", {"save": True, "choice": "spec_rule", "node_set": None})
-    assert entry["question"].startswith("反之") and entry["answer"] == "done." and "node_set" not in entry
+    (entry,) = _stop(
+        stop_hook,
+        "反之如果刪除段拉到其他操作段就以操作段為主",
+        {"save": True, "choice": "spec_rule", "node_set": None},
+    )
+    assert (
+        entry["question"].startswith("反之")
+        and entry["answer"] == "done."
+        and "node_set" not in entry
+    )
 
 
 def test_preference_turn_carries_user_context(stop_hook):
-    (entry,) = _stop(stop_hook, "以後 commit 訊息一律用英文", {"save": True, "choice": "preference", "node_set": "user_context"})
+    (entry,) = _stop(
+        stop_hook,
+        "以後 commit 訊息一律用英文",
+        {"save": True, "choice": "preference", "node_set": "user_context"},
+    )
     assert entry["node_set"] == ["user_context"]
 
 
@@ -269,17 +331,32 @@ def test_turn_without_a_verdict_is_stored_as_before(stop_hook):
 def test_a_verdict_left_over_from_another_turn_is_ignored(stop_hook):
     """An interrupted turn leaves its prompt parked; the next Stop must not inherit its drop."""
     later_turn = {**STOP_PAYLOAD, "prompt_id": "p2"}
-    (entry,) = _stop(stop_hook, "這個函式是做什麼的？", {"save": False, "choice": "question", "node_set": None}, later_turn)
+    (entry,) = _stop(
+        stop_hook,
+        "這個函式是做什麼的？",
+        {"save": False, "choice": "question", "node_set": None},
+        later_turn,
+    )
     assert entry["answer"] == "done.", "stored as before the gate existed"
 
 
 def test_a_stale_preference_route_is_ignored_too(stop_hook):
     later_turn = {**STOP_PAYLOAD, "prompt_id": "p2"}
-    (entry,) = _stop(stop_hook, "以後 commit 訊息一律用英文", {"save": True, "choice": "preference", "node_set": "user_context"}, later_turn)
+    (entry,) = _stop(
+        stop_hook,
+        "以後 commit 訊息一律用英文",
+        {"save": True, "choice": "preference", "node_set": "user_context"},
+        later_turn,
+    )
     assert "node_set" not in entry
 
 
 def test_a_verdict_is_ignored_when_the_host_names_no_turn(stop_hook):
     no_turn = {"last_assistant_message": "done."}
-    (entry,) = _stop(stop_hook, "CI 過了就 merge", {"save": False, "choice": "command", "node_set": None}, no_turn)
+    (entry,) = _stop(
+        stop_hook,
+        "CI 過了就 merge",
+        {"save": False, "choice": "command", "node_set": None},
+        no_turn,
+    )
     assert entry["question"] == "CI 過了就 merge"

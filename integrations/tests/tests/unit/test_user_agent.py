@@ -47,13 +47,17 @@ def test_plugin_requests_carry_the_plugin_user_agent(suite, isolated_modules, se
     # context= makes urlopen build a fresh opener, the path most plugin calls take.
     urllib.request.urlopen(url, timeout=5, context=ssl.create_default_context()).read()
     assert len(agents) == 2
-    assert all(a.startswith("cognee-memory-plugin") and "Python-urllib" not in a for a in agents), agents
+    assert all(a.startswith("cognee-memory-plugin") and "Python-urllib" not in a for a in agents), (
+        agents
+    )
 
 
 def test_an_explicit_user_agent_still_wins(suite, isolated_modules, seen_agents):
     isolated_modules(suite, "_plugin_common")
     url, agents = seen_agents
-    urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "custom/1"}), timeout=5).read()
+    urllib.request.urlopen(
+        urllib.request.Request(url, headers={"User-Agent": "custom/1"}), timeout=5
+    ).read()
     assert agents == ["custom/1"]
 
 

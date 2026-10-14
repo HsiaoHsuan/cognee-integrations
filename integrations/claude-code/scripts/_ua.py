@@ -16,7 +16,9 @@ import urllib.request
 
 
 def _version() -> str:
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".claude-plugin", "plugin.json")
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", ".claude-plugin", "plugin.json"
+    )
     try:
         with open(path, encoding="utf-8") as fh:
             return str(json.load(fh).get("version") or "")
