@@ -10,6 +10,25 @@ Code only offers an update when that string changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.6-fork.1]
+
+### Changed
+- **Only distilled memories reach long-term memory.** At idle and at session end
+  the transcript is read once and a model keeps only decisions, standing
+  preferences, product rules, project facts, feature requests and confirmed bug
+  fixes, each as one short sentence with its reason. This replaces bridging the
+  whole session with improve; the every-N-entries automatic improve no longer
+  runs. `COGNEE_DISTILL=false` restores improve.
+- **No memory is uncategorized.** Each distilled memory is remembered with a node
+  set: `["user_context", "preference"]` for a preference, `[<project tag>, <type>]`
+  for anything else. `remember` accepts a list of node sets.
+
+### Removed
+- **The per-prompt intent gate** (`COGNEE_CAPTURE_JUDGE`, `INTENT_GATE_URL`,
+  `INTENT_GATE_TOKEN`) and its Worker under `deploy/intent-gate`. Judging one
+  prompt at a time could not see the answer or what a bare "ok" agreed to;
+  distill reads the whole session instead.
+
 ## [1.6.6]
 
 ### Fixed

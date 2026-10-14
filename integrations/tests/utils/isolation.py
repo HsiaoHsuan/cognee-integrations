@@ -48,6 +48,7 @@ ISOLATED_MODULES = (
     "_remember_http",
     "_code_graph",
     "_observer",
+    "_distill",
     "cognee_plugin",
     "cognee_statusline_render",
     "doctor",
@@ -71,7 +72,10 @@ ISOLATED_MODULES = (
 #:   - COGNEE_LLM_OBSERVER=false keeps SessionStart from starting the Claude
 #:     observer shim (a detached process) on a machine with `claude` on PATH;
 #:     the observer tests opt back in.
+#:   - COGNEE_DISTILL=false keeps the improve path the hook tests assert on;
+#:     session distill would call `claude -p` instead. test_distill opts back in.
 DETERMINISTIC_ENV = {
+    "COGNEE_DISTILL": "false",
     "COGNEE_PLUGIN_IN_VENV": "1",
     "COGNEE_IDLE_DISABLED": "1",
     "COGNEE_UPDATE_CHECK": "off",
