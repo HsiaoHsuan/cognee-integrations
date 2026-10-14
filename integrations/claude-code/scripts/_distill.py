@@ -27,15 +27,12 @@ import os
 import re
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 _FALSE = {"0", "false", "no", "off"}
 DEFAULT_MODEL = "sonnet"
 CLAUDE_TIMEOUT = 900
-# How long to wait for the writes' background cognify before the one improve,
-# and the read timeout of that improve's submit (it runs in the background).
-ENRICH_WAIT_SECONDS = 600.0
-ENRICH_SUBMIT_TIMEOUT = 120.0
 
 # Each type: what it is, the neighbouring type to prefer instead (not_for), and
 # examples. bug_fix needs the answers, which is why it is judged per session.
@@ -275,9 +272,8 @@ def _tool_line(block: dict) -> str:
     return f"(tool {name}: {' '.join(str(target).split())[:160]})"
 
 
-def condense(path: Path) -> list[str]:
-    """Transcript -> one string per turn. Thinking, tool output and side chains are dropped."""
-    turns: list[str] = []
+def _turns(path: Path):
+    """Yield (tag, text, timestamp) per turn; tags are U<n> and A<n>, n counting user turns."""
     n = 0
     with path.open(encoding="utf-8") as fh:
         for line in fh:
@@ -304,7 +300,7 @@ def condense(path: Path) -> list[str]:
                 text = _INJECTED.sub("", text).strip()
                 if text:
                     n += 1
-                    turns.append(f"[U{n}] {_clip(text, USER_MAX)}")
+                    yield f"U{n}", _clip(text, USER_MAX), str(row.get("timestamp") or "")
             else:
                 parts = []
                 for b in blocks:
@@ -315,8 +311,35 @@ def condense(path: Path) -> list[str]:
                     elif b.get("type") == "tool_use":
                         parts.append(_tool_line(b))
                 if parts:
-                    turns.append(f"[A{n}] " + "\n".join(parts))
-    return turns
+                    yield f"A{n}", "\n".join(parts), str(row.get("timestamp") or "")
+
+
+def condense(path: Path) -> list[str]:
+    """Transcript -> one string per turn. Thinking, tool output and side chains are dropped."""
+    return [f"[{tag}] {text}" for tag, text, _ in _turns(path)]
+
+
+def turn_times(path: Path) -> dict[str, str]:
+    """When each turn was said, by tag; an answer split over rows keeps its first time."""
+    times: dict[str, str] = {}
+    for tag, _, stamp in _turns(path):
+        if stamp:
+            times.setdefault(tag, stamp)
+    return times
+
+
+_TURN_TAG = re.compile(r"\[([UA]\d+)\]")
+
+
+def effective_date(memory: dict, times: dict[str, str]) -> str:
+    """The time of the turn the memory's evidence quotes, else now.
+
+    Stored as the memory's ``effective_date`` so a later conflict review can
+    tell which of two contradicting memories is current.
+    """
+    match = _TURN_TAG.search(str(memory.get("evidence") or ""))
+    stamp = times.get(match.group(1), "") if match else ""
+    return stamp or datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def chunk(turns: list[str], limit: int = CHUNK_CHARS) -> list[str]:
@@ -663,22 +686,33 @@ def _project_tag(cwd: str) -> str:
     return project_tag(cwd, setting)
 
 
-def _remember(dataset: str, memory: dict, tags: list[str]) -> dict:
+def _remember(dataset: str, memory: dict, tags: list[str], date: str = "") -> dict:
     import _remember_http
-    from _plugin_common import dataset_id_for, resolved_http_endpoint_auth
+    from _plugin_common import dataset_id_for, hook_log, resolved_http_endpoint_auth
 
     service_url, api_key = resolved_http_endpoint_auth()
-    result = _remember_http.do_remember(
-        service_url,
-        api_key,
-        content(memory),
-        dataset,
-        tags,
-        dataset_id=dataset_id_for(dataset),
-        timeout=_remember_http._remember_timeout(),
-        # One improve for the whole run instead of one per memory (see _enrich).
-        self_improvement=False,
-    )
+
+    def send(metadata):
+        return _remember_http.do_remember(
+            service_url,
+            api_key,
+            content(memory),
+            dataset,
+            tags,
+            dataset_id=dataset_id_for(dataset),
+            timeout=_remember_http._remember_timeout(),
+            # Without session ids the server's improve only runs triplet
+            # enrichment, which is off unless TRIPLET_EMBEDDING is set, and
+            # cognify embeds triplets itself when it is on: nothing to run.
+            self_improvement=False,
+            external_metadata=metadata,
+        )
+
+    result = send([{"effective_date": date}] if date else None)
+    if date and isinstance(result, dict) and result.get("status") in (400, 422):
+        # A server that does not take the metadata still gets the memory.
+        hook_log("distill_metadata_rejected", {"status": result.get("status")})
+        result = send(None)
     if result == _remember_http.UNREACHABLE:
         return {"ok": False, "error": "unreachable"}
     if isinstance(result, dict) and result.get("error"):
@@ -687,39 +721,7 @@ def _remember(dataset: str, memory: dict, tags: list[str]) -> dict:
             "error": str(result.get("error"))[:200],
             "status": result.get("status"),
         }
-    return {"ok": True, "dataset_id": str(result.get("dataset_id") or "")}
-
-
-def _enrich(dataset: str, dataset_id: str, tags: list[str]) -> dict:
-    """One improve over the node sets this run wrote, without any session.
-
-    The writes skip the server's per-write improve, so a run of seven memories
-    costs one enrichment pass instead of seven. No session id is sent: the
-    session itself never reaches the graph, only what distill kept. Waits for
-    the background cognify of the writes first, or the pass would find nothing.
-    """
-    import _remember_http
-    from _dataset_access import write_fields
-    from _plugin_common import _json_http_request, resolved_http_endpoint_auth
-
-    service_url, api_key = resolved_http_endpoint_auth()
-    if dataset_id and _remember_http._background_flag() == "true":
-        waited = _remember_http._poll_status(
-            service_url,
-            api_key,
-            dataset_id,
-            _remember_http._float_env("COGNEE_DISTILL_COGNIFY_WAIT", ENRICH_WAIT_SECONDS),
-        )
-        if waited in ("errored", "timeout"):
-            return {"ok": False, "error": f"cognify {waited}"}
-    payload = {**write_fields(dataset), "node_name": tags, "run_in_background": True}
-    if dataset_id:
-        payload["dataset_id"] = dataset_id
-    try:
-        _json_http_request("/api/v1/improve", payload, timeout=ENRICH_SUBMIT_TIMEOUT)
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)[:200]}
-    return {"ok": True, "error": ""}
+    return {"ok": True}
 
 
 def _context(earlier: list[str]) -> list[str]:
@@ -798,12 +800,10 @@ def run(dataset: str, session_id: str, *, trigger: str) -> dict:
             )
             return {"ok": False, "reason": "failed", "error": str(exc)[:300]}
         failed = 0
-        written_tags: list[str] = []
-        dataset_id = ""
+        times = turn_times(transcript)
         for memory in result["memories"]:
             tags = node_sets(memory, tag)
-            outcome = _remember(dataset, memory, tags)
-            dataset_id = dataset_id or outcome.get("dataset_id", "")
+            outcome = _remember(dataset, memory, tags, effective_date(memory, times))
             if not outcome["ok"]:
                 failed += 1
                 hook_log(
@@ -811,15 +811,6 @@ def run(dataset: str, session_id: str, *, trigger: str) -> dict:
                 )
                 continue
             kept.append({"text": memory["text"], "type": memory["type"], "node_set": tags})
-            written_tags += [t for t in tags[:1] if t not in written_tags]
-        if written_tags:
-            enriched = _enrich(dataset, dataset_id, written_tags)
-            if not enriched["ok"]:
-                # The memories are written and recallable; only the enrichment
-                # is missing, and the next run's pass covers the same node sets.
-                hook_log(
-                    "distill_enrich_failed", {"session": session_id, "error": enriched["error"]}
-                )
         state["kept"] = kept
         if not failed:
             state["size"] = size

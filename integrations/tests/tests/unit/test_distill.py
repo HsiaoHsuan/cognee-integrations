@@ -148,7 +148,14 @@ def test_distill_drops_low_confidence(distill, monkeypatch):
 
 def test_run_writes_tagged_memories_once(distill, monkeypatch, tmp_path):
     transcript = _transcript(
-        tmp_path / "s.jsonl", [{"type": "user", "message": {"content": "用 pnpm"}}]
+        tmp_path / "s.jsonl",
+        [
+            {
+                "type": "user",
+                "timestamp": "2026-10-14T05:00:00.000Z",
+                "message": {"content": "用 pnpm"},
+            }
+        ],
     )
     distill.record_transcript("sess", str(transcript), str(tmp_path / "my-app"))
     seen = {}
@@ -167,19 +174,17 @@ def test_run_writes_tagged_memories_once(distill, monkeypatch, tmp_path):
     monkeypatch.setattr(
         distill,
         "_remember",
-        lambda ds, m, tags: written.append((ds, distill.content(m), tags)) or {"ok": True},
-    )
-    enriched = []
-    monkeypatch.setattr(
-        distill, "_enrich", lambda ds, did, tags: enriched.append(tags) or {"ok": True}
+        lambda ds, m, tags, date: (
+            written.append((ds, distill.content(m), tags, date)) or {"ok": True}
+        ),
     )
     monkeypatch.delenv("COGNEE_PROJECT_NODE_SET", raising=False)
 
     assert distill.run("ds", "sess", trigger="final")["ok"]
-    ((dataset, text, tags),) = written
+    ((dataset, text, tags, date),) = written
     assert dataset == "ds" and text == "一律用 pnpm 管理套件\nWhy: CI 會壞"
     assert tags[0].startswith("project-my-app-") and tags[1] == "decision"
-    assert enriched == [[tags[0]]]  # one improve for the run, over the project's node set
+    assert date == "2026-10-14T05:00:00.000Z"  # the time of [U1], the turn its evidence quotes
 
     # Unchanged transcript: nothing is distilled or written again.
     assert distill.run("ds", "sess", trigger="idle")["ok"]
@@ -233,7 +238,6 @@ def test_run_keeps_unwritten_for_retry(distill, monkeypatch, tmp_path):
         },
     )
     monkeypatch.setattr(distill, "_remember", lambda *a: {"ok": False, "error": "unreachable"})
-    monkeypatch.setattr(distill, "_enrich", lambda *a: {"ok": True})
     result = distill.run("ds", "sess", trigger="final")
     assert not result["ok"] and result["reason"] == "failed"
     calls = []
@@ -337,36 +341,64 @@ def test_writes_skip_the_per_write_improve(suite, isolated_modules, monkeypatch)
     assert b'name="self_improvement"\r\n\r\nfalse' in sent["body"]
     rh.do_remember("http://s", "k", "x", "ds", ["a"], opener=opener)
     assert b"self_improvement" not in sent["body"]  # left to the server default
+    assert b"external_metadata" not in sent["body"]
+    rh.do_remember(
+        "http://s",
+        "k",
+        "x",
+        "ds",
+        ["a"],
+        opener=opener,
+        external_metadata=[{"effective_date": "d"}],
+    )
+    assert b'name="external_metadata"\r\n\r\n[{"effective_date": "d"}]' in sent["body"]
 
 
-def test_enrich_waits_then_improves_once_without_a_session(distill, monkeypatch):
-    import _plugin_common
+def test_effective_date_is_the_quoted_turns_time(distill, tmp_path):
+    transcript = _transcript(
+        tmp_path / "s.jsonl",
+        [
+            {"type": "user", "timestamp": "T1", "message": {"content": "第一句"}},
+            {"type": "assistant", "timestamp": "T2", "message": {"content": "回答"}},
+            {"type": "assistant", "timestamp": "T3", "message": {"content": "回答的後半"}},
+            {"type": "user", "timestamp": "T4", "message": {"content": "第二句"}},
+        ],
+    )
+    times = distill.turn_times(transcript)
+    assert times == {"U1": "T1", "A1": "T2", "U2": "T4"}  # a split answer keeps its first time
+    assert distill.effective_date(_memory("x", evidence='[U2] "第二句"'), times) == "T4"
+    assert distill.effective_date(_memory("x", evidence="[A1] 回答"), times) == "T2"
+    # No tag, or a tag with no time: the write time, in ISO form.
+    assert distill.effective_date(_memory("x", evidence="沒有標記"), times).startswith("20")
+    assert distill.effective_date(_memory("x", evidence="[U9] x"), times).startswith("20")
+
+
+def test_rejected_metadata_still_writes_the_memory(distill, monkeypatch):
     import _remember_http
 
-    calls = []
-    monkeypatch.setattr(
-        _remember_http, "_poll_status", lambda *a, **k: calls.append("wait") or "completed"
-    )
-    monkeypatch.setattr(
-        _plugin_common,
-        "_json_http_request",
-        lambda path, payload, **k: calls.append((path, payload)) or {"ok": True},
-    )
-    assert distill._enrich("ds", "d1", ["project-a", "user_context"])["ok"]
-    assert calls[0] == "wait"
-    ((path, payload),) = calls[1:]
-    assert path == "/api/v1/improve"
-    assert payload["node_name"] == ["project-a", "user_context"]
-    assert payload["dataset_id"] == "d1"
-    assert "session_ids" not in payload
+    sent = []
+
+    def fake(*a, external_metadata=None, **k):
+        sent.append(external_metadata)
+        if external_metadata is not None:
+            return {"error": "bad external_metadata", "status": 422}
+        return {"ok": True}
+
+    monkeypatch.setattr(_remember_http, "do_remember", fake)
+    assert distill._remember("ds", _memory("一條記憶"), ["p", "decision"], "T1") == {"ok": True}
+    assert sent == [[{"effective_date": "T1"}], None]
 
 
-def test_enrich_skips_the_improve_when_cognify_failed(distill, monkeypatch):
-    import _plugin_common
+def test_other_write_errors_are_not_retried_without_metadata(distill, monkeypatch):
     import _remember_http
 
-    monkeypatch.setattr(_remember_http, "_poll_status", lambda *a, **k: "errored")
+    sent = []
     monkeypatch.setattr(
-        _plugin_common, "_json_http_request", lambda *a, **k: pytest.fail("must not improve")
+        _remember_http,
+        "do_remember",
+        lambda *a, external_metadata=None, **k: (
+            sent.append(external_metadata) or {"error": "server error", "status": 500}
+        ),
     )
-    assert distill._enrich("ds", "d1", ["project-a"]) == {"ok": False, "error": "cognify errored"}
+    assert not distill._remember("ds", _memory("一條記憶"), ["p", "decision"], "T1")["ok"]
+    assert len(sent) == 1

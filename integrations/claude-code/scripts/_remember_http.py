@@ -210,6 +210,7 @@ def do_remember(
     opener=urllib.request.urlopen,
     timeout=120.0,
     self_improvement=None,
+    external_metadata=None,
 ):
     """POST content to the server. Return {"ok": true}, an error envelope, or UNREACHABLE.
 
@@ -218,6 +219,10 @@ def do_remember(
     ``self_improvement=False`` stops the server from running improve after this
     one write, for a caller that writes several and improves once at the end.
     ``None`` leaves the server default (on).
+
+    ``external_metadata`` is a list with one dict per uploaded item, stored on
+    the item server-side (the form field takes a JSON array). ``None`` sends
+    nothing.
 
     ``dataset_id`` addresses the target by UUID (sent as ``datasetId``, which
     the endpoint accepts in place of ``datasetName``). Under shared agent
@@ -259,6 +264,8 @@ def do_remember(
     fields = {"node_set": node_set, "run_in_background": _background_flag()}
     if self_improvement is not None:
         fields["self_improvement"] = "true" if self_improvement else "false"
+    if external_metadata is not None:
+        fields["external_metadata"] = json.dumps(external_metadata, ensure_ascii=False)
     if ident:
         fields["datasetId"] = ident
     else:
