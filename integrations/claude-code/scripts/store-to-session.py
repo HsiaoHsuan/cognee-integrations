@@ -331,10 +331,10 @@ async def _store_assistant_stop(payload: dict) -> None:
     # The intent gate judged this turn's prompt as not worth keeping (a one-off
     # command, an acknowledgement). Skip the whole QA row: storing the answer
     # under an empty question would keep the noise and lose its cause.
+    import _intent_gate
+
     gate = pending.get("gate") or {}
     if gate:
-        import _intent_gate
-
         # A parked prompt can outlive its own turn (an interrupted turn never
         # reaches this pop). Its verdict is honoured only for the turn it was
         # made for; otherwise this turn is stored the way it always was.
@@ -342,12 +342,11 @@ async def _store_assistant_stop(payload: dict) -> None:
         if not turn or gate.get("turn") != turn:
             hook_log("stop_ignored_stale_gate", {"choice": gate.get("choice")})
             gate = {}
-    # The gate judges only the prompt; for these the value is in the answer
-    # (the cause found, the fix made), so dropping the turn would lose it.
-    if gate.get("save") is False and gate.get("choice") in ("question", "bug_report"):
+    if gate and gate.get("save") is False and not _intent_gate.drops_turn(gate):
+        # The value is in the answer; see _intent_gate.ANSWER_BEARING.
         hook_log("stop_kept_answer_bearing_turn", {"choice": gate.get("choice")})
         gate = {}
-    if gate.get("save") is False:
+    if _intent_gate.drops_turn(gate):
         hook_log("stop_dropped_by_intent_gate", {"choice": gate.get("choice"), "chars": len(msg)})
         return
 

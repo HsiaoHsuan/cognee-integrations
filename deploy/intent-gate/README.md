@@ -7,6 +7,7 @@
 prompt ─▶ 規則層 ─▶ Jev（只回 11 個固定標籤 + 機率）─▶ 驗證 ─▶ 信心門檻 ─▶ 查表 ─▶ 存／丟 + node_set
            │                         └──────── 任何失敗或沒把握 ────────▶ 照舊存（fail-open）
            └─ 好／繼續／ok、單獨一個 /指令：直接判，不呼叫 Jev
+              是／不是／no／不要：只有沒有前一輪回覆時才直接判；有的話交給 Jev（可能是在回答問題）
 ```
 
 ## 介面
@@ -18,7 +19,7 @@ prompt ─▶ 規則層 ─▶ Jev（只回 11 個固定標籤 + 機率）─▶
 | `POST /v1/judge` | 判斷一句 prompt |
 | `GET /v1/verdict?key=` | 拿同一輪已經判好的結果（沒有就 404），不用再送原文 |
 | `POST /mcp` | 同一個判斷包成 MCP tool `judge_intent`，給有 MCP 但沒有 hook 的 agent |
-| `GET /health` | 存活檢查，不用 token |
+| `GET /health` | 存活檢查和目前設定（provider、model、`ready`、`problem`，不含密鑰），不用 token |
 
 ```jsonc
 // POST /v1/judge
@@ -62,8 +63,8 @@ Claude Code 同一個事件的 hook 是平行跑的，沒有先後順序，hook 
 | 變數 | 預設 | 說明 |
 |---|---|---|
 | `DECIDER_PROVIDER` | `cloudflare` | `cloudflare`＝Workers AI binding（不用 key，Unified Billing、不在免費額度）；`typesafe`＝直接打 `api.typesafe.ai` |
-| `DECIDER_MODEL` | `typesafe/jev` | Workers AI 的模型 ID |
-| `TYPESAFE_MODEL` | `jev-latest` | `typesafe` provider 用 |
+| `DECIDER_MODEL` | `typesafe/jev` | Workers AI 的模型 ID。Workers AI 目前沒有可固定版本的 ID，模型更新時判斷結果可能會變；`?debug=1` 回應裡的 `model` 會記錄實際用的版本 |
+| `TYPESAFE_MODEL` | `jev-1.13.0` | `typesafe` provider 用。固定版本，不用 `jev-latest`：門檻是用這一版測出來的，換版前先重跑考卷 |
 | `CONFIDENCE_THRESHOLD` | `0.8` | 低於這個信心就不採信，照舊存 |
 | `DEFAULT_PROJECT_NODE_SET` | `project` | 呼叫端沒給 `project` 時用 |
 | `VERDICT_TTL_SECONDS` | `86400` | 帶 key 的判斷保留多久 |
@@ -74,6 +75,10 @@ Secrets：
 openssl rand -hex 32 | npx wrangler secret put GATE_TOKEN   # 必要；沒設時所有請求回 503
 npx wrangler secret put TYPESAFE_API_KEY                    # 只有 DECIDER_PROVIDER=typesafe 才需要
 ```
+
+設定錯誤（`DECIDER_PROVIDER=cloudflare` 卻沒有 AI binding、`typesafe` 卻沒有 key、或 provider 名稱打錯）不會改走另一個 provider：每次判斷都記一筆 `misconfigured` 的 fallback 並照舊存，`/health` 的 `problem` 會寫出原因。
+
+逾時：每次呼叫 Jev 最多 10 秒、只重試 1 次（429／503／529），整個判斷最多 20 秒，比 plugin 預設的 30 秒短。這樣 plugin 放棄等待後，Worker 不會再為同一輪寫入不同的判斷。
 
 ## 部署
 
@@ -121,7 +126,8 @@ plugin 端做的事：
 export INTENT_GATE_URL=https://intent-gate.<subdomain>.workers.dev
 export INTENT_GATE_TOKEN=...
 
-python3 eval/run_exam.py eval/known_hard.jsonl          # 三句已知難題 + 六句示範，先確認通
+python3 eval/run_exam.py eval/known_hard.jsonl          # 已知難題（含上下文裡的是非題、客氣的指令），先確認通
+python3 eval/run_exam.py eval/phrasings.jsonl           # 64 句：11 種意圖各用多種說法（直述、疑問、條件、否定、客氣、英文、短句、帶路徑）
 
 python3 eval/make_exam.py -n 150 -o exam.jsonl          # 從 ~/.claude/history.jsonl 抽樣，含前一輪回覆
 #   → 手動把每行的 "intent" 填上 11 個標籤之一（可用 a|b 表示都算對）

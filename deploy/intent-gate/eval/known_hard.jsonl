@@ -7,3 +7,12 @@
 {"text": "幫我看一下這個 test 為什麼 fail", "project": "demo", "context": null, "intent": "command|question|bug_report"}
 {"text": "哈哈這個好好笑", "project": "demo", "context": null, "intent": "chitchat"}
 {"text": "把第 42 行的變數改名成 userId", "project": "demo", "context": null, "intent": "command"}
+{"text": "no", "project": "demo", "context": "Redis 在 Zeabur 免費方案沒有。要不要改用 Postgres 的 LISTEN/NOTIFY？", "intent": "decision"}
+{"text": "不要", "project": "demo", "context": "我可以順便把所有 any 型別改成 unknown，要一起改嗎？", "intent": "choice_reply|command"}
+{"text": "對", "project": "demo", "context": "所以規則是：刪除段拖到操作段時，以操作段為主，對嗎？", "intent": "spec_rule|decision"}
+{"text": "可以幫我跑一下測試嗎", "project": "demo", "context": null, "intent": "command"}
+{"text": "可以讓匯出按鈕在手機版也出現嗎", "project": "demo", "context": null, "intent": "feature_req"}
+{"text": "以後改完都先跑 lint 再 commit", "project": "demo", "context": null, "intent": "preference"}
+{"text": "登入頁在 Safari 白屏", "project": "demo", "context": null, "intent": "bug_report"}
+{"text": "這個專案用 pnpm，不要用 npm", "project": "demo", "context": null, "intent": "project_fact|preference|decision"}
+{"text": "先這樣，明天再繼續", "project": "demo", "context": null, "intent": "chitchat|ack"}

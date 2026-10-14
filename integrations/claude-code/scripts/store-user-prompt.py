@@ -219,7 +219,11 @@ async def _store(prompt: str, payload: dict):
         annotate_pending_prompt(
             session_id, gate, turn_id=str(payload.get("turn_id") or ""), prompt=safe_prompt
         )
-    if gate is not None and not gate["save"]:
+    import _intent_gate
+
+    # Matches what Stop will do: a question or bug report is judged "drop" but
+    # its turn is still stored for the answer, so it is not reported as dropped.
+    if _intent_gate.drops_turn(gate):
         hook_log("prompt_dropped", {"chars": len(prompt), "choice": gate["choice"]})
         notify(f"user prompt not kept ({gate['choice']})")
     else:

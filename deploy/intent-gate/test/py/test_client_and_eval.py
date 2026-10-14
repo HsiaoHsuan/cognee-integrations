@@ -325,7 +325,13 @@ class ScoringTest(unittest.TestCase):
 
     def test_shipped_exam_is_valid(self):
         rows = run_exam.load_exam(str(ROOT / "eval" / "known_hard.jsonl"))
-        self.assertEqual(len(rows), 9)
+        self.assertEqual(len(rows), 18)
+
+    def test_phrasing_exam_is_valid_and_covers_every_intent(self):
+        rows = run_exam.load_exam(str(ROOT / "eval" / "phrasings.jsonl"))
+        self.assertEqual(len(rows), 64)
+        firsts = {row["intent"].split("|")[0] for row in rows}
+        self.assertEqual(firsts, set(intent_gate.INTENTS))
 
 
 class JudgesTest(unittest.TestCase):

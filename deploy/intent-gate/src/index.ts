@@ -1,4 +1,4 @@
-import { gateDeps, type Env } from "./env";
+import { gateDeps, providerStatus, type Env } from "./env";
 import { judge, parseInput } from "./gate";
 import { errText } from "./jev";
 import { handleMcp } from "./mcp";
@@ -11,7 +11,7 @@ export { VerdictStore } from "./verdict-store";
 //   POST /v1/judge          IntentInput (+ optional `key`) -> IntentOutput
 //   GET  /v1/verdict?key=   the verdict already reached for that key, or 404
 //   POST /mcp               the same judgement as an MCP tool
-//   GET  /health            liveness, no auth
+//   GET  /health            liveness and decider config (no secrets), no auth
 
 const MAX_KEY_CHARS = 256;
 const MAX_BODY_BYTES = 256 * 1024;
@@ -20,7 +20,10 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === "/health") return Response.json({ ok: true });
+    if (url.pathname === "/health") {
+      const { provider, model, problem } = providerStatus(env);
+      return Response.json({ ok: true, ready: !problem && !!env.GATE_TOKEN, provider, model, problem });
+    }
 
     const denied = await authorize(request, env);
     if (denied) return denied;

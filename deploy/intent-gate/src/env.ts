@@ -1,5 +1,5 @@
 import type { GateDeps } from "./gate";
-import { cloudflareProvider, typesafeProvider } from "./jev";
+import { JevError, cloudflareProvider, typesafeProvider, type JevCall } from "./jev";
 import type { VerdictStore } from "./verdict-store";
 
 export interface Env {
@@ -21,16 +21,48 @@ export interface Env {
   VERDICT_TTL_SECONDS?: string;
 }
 
+export interface ProviderStatus {
+  provider: string;
+  model: string;
+  /** Why no judgement can succeed with this configuration; null when it can. */
+  problem: string | null;
+}
+
+/** What the Worker will call, and whether that can work. Never includes a secret. */
+export function providerStatus(env: Env): ProviderStatus {
+  const provider = (env.DECIDER_PROVIDER || "cloudflare").trim().toLowerCase();
+  if (provider === "cloudflare") {
+    return {
+      provider,
+      model: env.DECIDER_MODEL || "typesafe/jev",
+      problem: env.AI ? null : "DECIDER_PROVIDER=cloudflare but the AI binding is missing",
+    };
+  }
+  if (provider === "typesafe") {
+    return {
+      provider,
+      model: env.TYPESAFE_MODEL || "jev-1.13.0",
+      problem: env.TYPESAFE_API_KEY ? null : "DECIDER_PROVIDER=typesafe but TYPESAFE_API_KEY is not set",
+    };
+  }
+  return { provider, model: "", problem: `unknown DECIDER_PROVIDER "${provider}" (use cloudflare or typesafe)` };
+}
+
 export function gateDeps(env: Env): GateDeps {
-  const provider = (env.DECIDER_PROVIDER || "typesafe").toLowerCase();
-  const callJev =
-    provider === "cloudflare" && env.AI
-      ? cloudflareProvider({ ai: env.AI, model: env.DECIDER_MODEL || "typesafe/jev" })
-      : typesafeProvider({
-          apiKey: env.TYPESAFE_API_KEY,
-          model: env.TYPESAFE_MODEL || "jev-latest",
-          baseUrl: env.TYPESAFE_BASE_URL,
-        });
+  const status = providerStatus(env);
+  let callJev: JevCall;
+  if (status.problem) {
+    // Misconfigured: say so on every call instead of quietly trying another
+    // provider. The verdict still fails open, and /health shows the problem.
+    const problem = status.problem;
+    callJev = async () => {
+      throw new JevError(`misconfigured: ${problem}`, false);
+    };
+  } else if (status.provider === "cloudflare") {
+    callJev = cloudflareProvider({ ai: env.AI!, model: status.model });
+  } else {
+    callJev = typesafeProvider({ apiKey: env.TYPESAFE_API_KEY, model: status.model, baseUrl: env.TYPESAFE_BASE_URL });
+  }
 
   return {
     callJev,

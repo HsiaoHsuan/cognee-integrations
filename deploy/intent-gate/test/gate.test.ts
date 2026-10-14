@@ -1,6 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
 import { judge, parseInput, type GateDeps } from "../src/gate";
-import { JevError, buildRequest, callWithRetry, typesafeProvider, unwrap, validateChoice, type JevCall } from "../src/jev";
+import {
+  DEADLINE_MS,
+  JevError,
+  MAX_RETRIES,
+  TIMEOUT_MS,
+  buildRequest,
+  callWithRetry,
+  typesafeProvider,
+  unwrap,
+  validateChoice,
+  type JevCall,
+} from "../src/jev";
+import { gateDeps, providerStatus, type Env } from "../src/env";
 import { ruleVerdict } from "../src/rules";
 import { INTENTS, InputError, type Intent } from "../src/types";
 
@@ -28,6 +40,16 @@ function deps(callJev: JevCall, extra: Partial<GateDeps> = {}): GateDeps {
 describe("rule layer", () => {
   it.each(["好", "繼續", "ok", "OK!", "好的。", "lgtm", "謝謝"])("treats %s as an acknowledgement", (t) => {
     expect(ruleVerdict(t)).toBe("ack");
+    expect(ruleVerdict(t, "要改用 Postgres 嗎？")).toBe("ack");
+  });
+
+  it.each(["no", "No.", "yes", "y", "對", "是", "不是", "不要", "不用！"])("treats a bare %s as an acknowledgement when nothing was asked", (t) => {
+    expect(ruleVerdict(t)).toBe("ack");
+    expect(ruleVerdict(t, "   ")).toBe("ack");
+  });
+
+  it.each(["no", "yes", "不要", "對", "不用"])("hands %s to the model when it answers the previous reply", (t) => {
+    expect(ruleVerdict(t, "要不要改用 Postgres 的 LISTEN/NOTIFY 取代 Redis？")).toBeNull();
   });
 
   it.each(["/clear", "/compact", "/cognee:recap", " /clear "])("treats the bare command %s as a slash command", (t) => {
@@ -46,6 +68,13 @@ describe("rule layer", () => {
 
   it.each(["B + 2", "CI 過了就 merge", "好，但是匯出改成底部彈出", "手機版的"])("hands %s to the model", (t) => {
     expect(ruleVerdict(t)).toBeNull();
+  });
+
+  it("asks Jev about a yes/no that answers a question", async () => {
+    const callJev = vi.fn(async () => jevResponse("decision"));
+    const { output } = await judge({ text: "no", context: "要改用 Postgres 嗎？", project: "demo" }, deps(callJev));
+    expect(output).toMatchObject({ save: true, choice: "decision", source: "jev" });
+    expect(callJev).toHaveBeenCalledTimes(1);
   });
 
   it("decides without calling Jev", async () => {
@@ -260,15 +289,47 @@ describe("retry and timeout", () => {
       .mockRejectedValueOnce(new JevError("HTTP 429", true))
       .mockRejectedValueOnce(new JevError("HTTP 529", true))
       .mockResolvedValueOnce(jevResponse("ack"));
-    const { attempts } = await callWithRetry(call, body, { sleep: async (ms) => void sleeps.push(ms) });
+    const { attempts } = await callWithRetry(call, body, { retries: 3, sleep: async (ms) => void sleeps.push(ms) });
     expect(attempts).toBe(3);
     expect(sleeps).toEqual([500, 1000]);
   });
 
-  it("gives up after 3 retries", async () => {
+  it("retries once by default", async () => {
     const call = vi.fn<JevCall>().mockRejectedValue(new JevError("HTTP 503", true));
     await expect(callWithRetry(call, body, { sleep: async () => {} })).rejects.toThrow("HTTP 503");
-    expect(call).toHaveBeenCalledTimes(4);
+    expect(call).toHaveBeenCalledTimes(2);
+  });
+
+  it("finishes inside the plugin client's 30s wait", () => {
+    expect(TIMEOUT_MS * (MAX_RETRIES + 1)).toBeLessThanOrEqual(DEADLINE_MS);
+    expect(DEADLINE_MS).toBeLessThan(30_000);
+  });
+
+  it("does not retry past the deadline", async () => {
+    let clock = 0;
+    const call = vi.fn<JevCall>().mockImplementation(async () => {
+      clock += 19_800;
+      throw new JevError("HTTP 503", true);
+    });
+    await expect(
+      callWithRetry(call, body, { retries: 3, deadlineMs: 20_000, now: () => clock, sleep: async () => {} }),
+    ).rejects.toThrow("HTTP 503");
+    expect(call).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives each attempt only what is left of the deadline", async () => {
+    let clock = 0;
+    const call = vi
+      .fn<JevCall>()
+      .mockImplementationOnce(async () => {
+        clock += 14_000;
+        throw new JevError("HTTP 429", true);
+      })
+      .mockImplementation(() => new Promise(() => {}));
+    await expect(
+      callWithRetry(call, body, { deadlineMs: 14_550, now: () => clock, sleep: async (ms) => void (clock += ms) }),
+    ).rejects.toThrow("timed out after 50ms");
+    expect(call).toHaveBeenCalledTimes(2);
   });
 
   it("does not retry other failures", async () => {
@@ -293,5 +354,39 @@ describe("retry and timeout", () => {
   it("times out a call that never returns", async () => {
     const call: JevCall = () => new Promise(() => {});
     await expect(callWithRetry(call, body, { timeoutMs: 20 })).rejects.toThrow(/timed out/);
+  });
+});
+
+describe("provider configuration", () => {
+  const ai = { run: vi.fn(async () => jevResponse("spec_rule")) };
+  const base = { VERDICTS: {} } as unknown as Env;
+
+  it("defaults to Workers AI", () => {
+    expect(providerStatus({ ...base, AI: ai })).toEqual({ provider: "cloudflare", model: "typesafe/jev", problem: null });
+  });
+
+  it("pins the TypeSafe model instead of following jev-latest", () => {
+    expect(providerStatus({ ...base, DECIDER_PROVIDER: "typesafe", TYPESAFE_API_KEY: "k" }).model).toBe("jev-1.13.0");
+  });
+
+  it.each([
+    [{}, /AI binding is missing/],
+    [{ DECIDER_PROVIDER: "typesafe" }, /TYPESAFE_API_KEY is not set/],
+    [{ DECIDER_PROVIDER: "openai", AI: ai }, /unknown DECIDER_PROVIDER/],
+  ])("reports %o as misconfigured", (extra, problem) => {
+    expect(providerStatus({ ...base, ...extra } as Env).problem).toMatch(problem);
+  });
+
+  it("does not quietly switch provider when the AI binding is missing", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const { output, debug } = await judge({ text: "以後都用 pnpm", project: "demo" }, {
+      ...gateDeps({ ...base, TYPESAFE_API_KEY: "k" }),
+      retry: { sleep: async () => {} },
+      log: () => {},
+    });
+    expect(output.source).toBe("fallback");
+    expect(debug.fallback_reason).toMatch(/misconfigured: DECIDER_PROVIDER=cloudflare but the AI binding is missing/);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    fetchSpy.mockRestore();
   });
 });

@@ -17,7 +17,7 @@
     // "cloudflare" = Workers AI binding (no key). "typesafe" = api.typesafe.ai (needs TYPESAFE_API_KEY secret).
     "DECIDER_PROVIDER": "cloudflare",
     "DECIDER_MODEL": "typesafe/jev",
-    "TYPESAFE_MODEL": "jev-latest",
+    "TYPESAFE_MODEL": "jev-1.13.0",
     // Below this confidence the verdict is not trusted and the prompt is kept (fail-open).
     "CONFIDENCE_THRESHOLD": "0.8",
     // node_set used for project intents when the caller sends no `project`.

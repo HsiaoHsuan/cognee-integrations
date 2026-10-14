@@ -27,6 +27,17 @@ from typing import Callable, Optional
 SAVE_INTENTS = ("spec_rule", "preference", "decision", "project_fact", "feature_req")
 DROP_INTENTS = ("bug_report", "command", "question", "choice_reply", "ack", "chitchat")
 INTENTS = SAVE_INTENTS + DROP_INTENTS
+# Drop intents whose turn is still worth keeping: the gate judges only the
+# prompt, and for these the value is in the answer (the cause found, the fix
+# made). A hook that stores whole turns keeps them; one that stores prompts
+# alone drops them.
+ANSWER_BEARING = ("question", "bug_report")
+
+
+def drops_turn(gate: Optional[dict]) -> bool:
+    """True when a verdict means the whole turn (prompt and answer) is skipped."""
+    return bool(gate) and gate.get("save") is False and gate.get("choice") not in ANSWER_BEARING
+
 
 MAX_CONTEXT_CHARS = 1200
 # workers.dev rejects the default "Python-urllib/x.y" agent (Cloudflare error
