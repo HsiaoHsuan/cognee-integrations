@@ -10,6 +10,23 @@ Code only offers an update when that string changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.6-fork.3]
+
+### Changed
+- **Distilled memories carry an `effective_date`.** Each one is remembered with
+  `external_metadata` `[{"effective_date": ...}]`, the transcript time of the turn
+  its evidence quotes (the write time when there is none), so a conflict review
+  in a later Cognee can tell which of two contradicting memories is current. A
+  server that rejects the metadata (400/422) gets the memory again without it.
+
+### Removed
+- **The end-of-run enrichment pass from 1.6.6-fork.2** and
+  `COGNEE_DISTILL_COGNIFY_WAIT`. On Cognee 1.6.4 an improve without session ids
+  runs only triplet enrichment, which is skipped unless `TRIPLET_EMBEDDING` is
+  set (and cognify embeds triplets itself when it is), so the pass did nothing
+  and only kept the run waiting up to 600 seconds for cognify. Writes still send
+  `self_improvement=false`, for the same reason.
+
 ## [1.6.6-fork.2]
 
 ### Changed
