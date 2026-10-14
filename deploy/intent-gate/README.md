@@ -84,7 +84,7 @@ npx wrangler deploy
 
 ## 接到 cognee-memory（Claude Code plugin）
 
-plugin 端的改動已經在這個 fork 的 `integrations/claude-code/`（版本 `1.6.4-gate.*`），不是另外的 patch。安裝：`/plugin marketplace add HsiaoHsuan/cognee-integrations` → `/plugin install cognee-memory@cognee`。不要改 `~/.claude/plugins/cache/…`（plugin 更新會蓋掉）。
+plugin 端的改動已經在這個 fork 的 `integrations/claude-code/`（版本 `1.6.x-gate.*`），不是另外的 patch。安裝：`/plugin marketplace add HsiaoHsuan/cognee-integrations` → `/plugin install cognee-memory@cognee`。不要改 `~/.claude/plugins/cache/…`（plugin 更新會蓋掉）。
 
 plugin 測試：
 
