@@ -44,10 +44,12 @@ def _multipart_body(fields, files):
     boundary = f"----cogneeRemember{uuid.uuid4().hex}"
     chunks = []
     for name, value in fields.items():
-        chunks.append(f"--{boundary}\r\n".encode("utf-8"))
-        chunks.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
-        chunks.append(str(value).encode("utf-8"))
-        chunks.append(b"\r\n")
+        # A list is sent as the field repeated, which is how FastAPI reads list[str] = Form().
+        for item in value if isinstance(value, (list, tuple)) else [value]:
+            chunks.append(f"--{boundary}\r\n".encode("utf-8"))
+            chunks.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+            chunks.append(str(item).encode("utf-8"))
+            chunks.append(b"\r\n")
     for field_name, filename, content in files:
         chunks.append(f"--{boundary}\r\n".encode("utf-8"))
         chunks.append(
@@ -70,6 +72,8 @@ def text_upload_name(node_set, content):
     treats them.
     """
     data = content.encode("utf-8") if isinstance(content, str) else content
+    if isinstance(node_set, (list, tuple)):
+        node_set = node_set[0] if node_set else ""
     return f"{node_set or 'content'}-{hashlib.sha256(data).hexdigest()[:32]}.txt"
 
 
@@ -207,6 +211,8 @@ def do_remember(
     timeout=120.0,
 ):
     """POST content to the server. Return {"ok": true}, an error envelope, or UNREACHABLE.
+
+    ``node_set`` is one tag or a list of tags; the upload is named after the first.
 
     ``dataset_id`` addresses the target by UUID (sent as ``datasetId``, which
     the endpoint accepts in place of ``datasetName``). Under shared agent
