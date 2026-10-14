@@ -1,16 +1,23 @@
 import { QUESTION, buildRequest, callWithRetry, errText, unwrap, validateChoice, type JevCall, type RetryOptions } from "./jev";
-import { decide, fallback, isSaveIntent } from "./policy";
+import { decide, fallback } from "./policy";
 import { ruleVerdict } from "./rules";
-import { InputError, SAVE_INTENTS, type IntentInput, type JudgeResult } from "./types";
+import { DROP_INTENTS, InputError, SAVE_INTENTS, type Intent, type IntentInput, type JudgeResult } from "./types";
 
 // The whole decision in one place:
-//   rule layer -> Jev -> validate -> confidence threshold -> intent table
+//   rule layer -> Jev -> validate -> keep-or-drop by probability mass -> intent table
 // Any failure after the rule layer keeps the prompt (fail-open).
+//
+// Jev answers one probability per intent. The question that matters is keep or
+// drop, so the decision adds the probabilities up per side instead of asking
+// whether the single top intent is sure of itself: "command 0.53, chitchat
+// 0.36, question 0.06" is a confident drop (0.95) even though no one intent is.
 
 export interface GateDeps {
   callJev: JevCall;
-  /** Below this confidence the verdict is not trusted. */
-  threshold: number;
+  /** Drop only when the drop intents together reach this probability. */
+  dropThreshold: number;
+  /** File under user_context only when `preference` alone reaches this probability. */
+  routeThreshold: number;
   /** node_set for project intents when the caller sends no project. */
   defaultProjectNodeSet: string;
   retry?: RetryOptions;
@@ -72,21 +79,45 @@ export async function judge(input: IntentInput, deps: GateDeps): Promise<JudgeRe
   }
 
   const debug = { raw: valid, model, usage, attempts };
-  if (valid.confidence < deps.threshold) {
-    return failOpen("low_confidence", debug);
-  }
-  // A drop is only taken when it clearly beats every keep intent. Real Jev
-  // derives confidence from the top probability, so this cannot trigger above
-  // the threshold; it guards against a provider that reports them independently.
-  if (!isSaveIntent(valid.choice)) {
-    const top = valid.probabilities[valid.choice] ?? 0;
-    if (SAVE_INTENTS.some((k) => (valid.probabilities[k] ?? 0) >= top - 1e-6)) {
-      return failOpen("tie_with_keep_intent", debug);
-    }
-  }
+  const p = valid.probabilities;
+  const pDrop = sum(DROP_INTENTS.map((k) => p[k] ?? 0));
+  const pKeep = sum(SAVE_INTENTS.map((k) => p[k] ?? 0));
 
+  if (pDrop >= deps.dropThreshold) {
+    const choice = top(DROP_INTENTS, p);
+    return {
+      output: decide(choice, round(pDrop), "jev", input.project, deps.defaultProjectNodeSet),
+      debug: { ...debug, p_drop: round(pDrop), elapsed_ms: now() - started },
+    };
+  }
+  // Not a confident drop. Keep it; when keeping is not even the likelier side,
+  // say so (fallback) rather than present a guess as Jev's verdict.
+  if (pKeep < pDrop) return failOpen("uncertain", { ...debug, p_drop: round(pDrop) });
+
+  // A preference goes to the shared user_context only when Jev is sure of that
+  // label itself; otherwise the prompt stays with the project, under the most
+  // likely project intent.
+  let choice = top(SAVE_INTENTS, p);
+  if (choice === "preference" && (p.preference ?? 0) < deps.routeThreshold) {
+    choice = top(
+      SAVE_INTENTS.filter((k) => k !== "preference"),
+      p,
+    );
+  }
   return {
-    output: decide(valid.choice, valid.confidence, "jev", input.project, deps.defaultProjectNodeSet),
-    debug: { ...debug, elapsed_ms: now() - started },
+    output: decide(choice, round(pKeep), "jev", input.project, deps.defaultProjectNodeSet),
+    debug: { ...debug, p_drop: round(pDrop), elapsed_ms: now() - started },
   };
+}
+
+function top<T extends Intent>(keys: readonly T[], p: Record<string, number>): T {
+  return keys.reduce((best, k) => ((p[k] ?? 0) > (p[best] ?? 0) ? k : best));
+}
+
+function sum(values: number[]): number {
+  return values.reduce((a, b) => a + b, 0);
+}
+
+function round(x: number): number {
+  return Math.round(x * 1e4) / 1e4;
 }

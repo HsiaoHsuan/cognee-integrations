@@ -11,7 +11,8 @@
   "vars": {
     "DECIDER_PROVIDER": "typesafe",
     "TYPESAFE_MODEL": "jev-1.13.0",
-    "CONFIDENCE_THRESHOLD": "0.5",
+    "DROP_THRESHOLD": "0.85",
+    "ROUTE_THRESHOLD": "0.6",
     "DEFAULT_PROJECT_NODE_SET": "project"
   }
 }

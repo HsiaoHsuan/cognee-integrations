@@ -30,7 +30,8 @@ function jevResponse(choice: Intent, p?: number, confidence?: number) {
 function deps(callJev: JevCall, extra: Partial<GateDeps> = {}): GateDeps {
   return {
     callJev,
-    threshold: 0.5,
+    dropThreshold: 0.85,
+    routeThreshold: 0.6,
     defaultProjectNodeSet: "project",
     retry: { sleep: async () => {} },
     ...extra,
@@ -129,7 +130,8 @@ describe("intent table", () => {
       { text: "反之如果刪除段拉到其他操作段就以操作段為主", project: "ffmpeg" },
       deps(async () => jevResponse("spec_rule")),
     );
-    expect(output).toEqual({ save: true, choice: "spec_rule", confidence: 0.86, node_set: "ffmpeg", source: "jev" });
+    // confidence is the keep side's total: 0.9 + 4 × 0.01
+    expect(output).toEqual({ save: true, choice: "spec_rule", confidence: 0.94, node_set: "ffmpeg", source: "jev" });
   });
 
   it("stores preferences under user_context regardless of project", async () => {
@@ -184,29 +186,100 @@ describe("fail-open", () => {
     expect(debug.fallback_reason).toMatch(/^invalid_response/);
   });
 
-  it("keeps the prompt when confidence is below the threshold, even for a drop intent", async () => {
+  it("keeps the prompt when neither side is likely enough", async () => {
+    // command 0.4, the other ten 0.06 each: drop side 0.7, keep side 0.3
     const { output, debug } = await judge(
       { text: "CI 過了就 merge", project: "ffmpeg" },
       deps(async () => jevResponse("command", 0.4, 0.34)),
     );
     expect(output).toEqual(FALLBACK);
-    expect(debug.fallback_reason).toBe("low_confidence");
+    expect(debug.fallback_reason).toBe("uncertain");
     expect(debug.raw?.choice).toBe("command"); // still visible for threshold tuning
+    expect(debug.p_drop).toBeCloseTo(0.7);
+  });
+});
+
+/** A Jev answer with exactly these probabilities (every other intent 0). */
+function jevWith(probs: Partial<Record<Intent, number>>) {
+  const probabilities = Object.fromEntries(INTENTS.map((k) => [k, probs[k] ?? 0]));
+  const choice = INTENTS.reduce((a, b) => (probabilities[b]! > probabilities[a]! ? b : a));
+  return {
+    model: "jev-test",
+    answers: { intent: { type: "choice", choice, probabilities, confidence: probabilities[choice]! - 0.05 } },
+  };
+}
+
+describe("keep or drop by probability mass", () => {
+  // The three prompts the live gate kept on 2026-10-14 because no single
+  // intent reached 0.8, although Jev was sure they were droppable.
+  it("drops when the drop intents together are sure, though none is alone", async () => {
+    const { output, debug } = await judge(
+      { text: "...", project: "demo" },
+      deps(async () => jevWith({ command: 0.53, chitchat: 0.36, question: 0.06, spec_rule: 0.03, decision: 0.02 })),
+    );
+    expect(output).toEqual({ save: false, choice: "command", confidence: 0.95, node_set: null, source: "jev" });
+    expect(debug.p_drop).toBeCloseTo(0.95);
   });
 
-  it("keeps the prompt when a drop intent only ties with a keep intent", async () => {
-    const tied = jevResponse("question", 0.5, 0.9);
-    const probabilities = Object.fromEntries(INTENTS.map((k) => [k, k === "question" || k === "spec_rule" ? 0.5 : 0]));
-    (tied.answers.intent as { probabilities: Record<string, number> }).probabilities = probabilities;
-    const { output, debug } = await judge({ text: "這個要怎麼處理比較好", project: "ffmpeg" }, deps(async () => tied));
-    expect(output).toEqual(FALLBACK);
-    expect(debug.fallback_reason).toBe("tie_with_keep_intent");
+  it("drops a close call between command and chitchat", async () => {
+    const { output } = await judge(
+      { text: "...", project: "demo" },
+      deps(async () => jevWith({ command: 0.48, chitchat: 0.42, question: 0.05, spec_rule: 0.05 })),
+    );
+    expect(output).toMatchObject({ save: false, choice: "command", source: "jev" });
+    expect(output.confidence).toBeCloseTo(0.95);
   });
 
-  it("trusts a verdict exactly at the threshold", async () => {
-    const { output } = await judge({ text: "CI 過了就 merge" }, deps(async () => jevResponse("command", 0.6, 0.5)));
-    expect(output.source).toBe("jev");
-    expect(output.save).toBe(false);
+  it("names a question/bug_report split as a question (its answer is kept by the hook)", async () => {
+    const { output } = await judge(
+      { text: "...", project: "demo" },
+      deps(async () => jevWith({ question: 0.78, bug_report: 0.22 })),
+    );
+    expect(output).toMatchObject({ save: false, choice: "question", confidence: 1, source: "jev" });
+  });
+
+  it("drops exactly at the threshold", async () => {
+    const { output } = await judge({ text: "..." }, deps(async () => jevWith({ command: 0.85, spec_rule: 0.15 })));
+    expect(output).toMatchObject({ save: false, choice: "command", source: "jev" });
+  });
+
+  it("keeps just below the threshold, under the likeliest keep intent", async () => {
+    const { output, debug } = await judge(
+      { text: "...", project: "demo" },
+      deps(async () => jevWith({ command: 0.3, question: 0.2, decision: 0.35, spec_rule: 0.15 })),
+    );
+    expect(output).toEqual({ save: true, choice: "decision", confidence: 0.5, node_set: "demo", source: "jev" });
+    expect(debug.p_drop).toBeCloseTo(0.5);
+  });
+
+  it("keeps when the keep intents together win, even if a drop intent is the top label", async () => {
+    const { output } = await judge(
+      { text: "...", project: "demo" },
+      deps(async () => jevWith({ command: 0.4, spec_rule: 0.3, project_fact: 0.3 })),
+    );
+    expect(output).toMatchObject({ save: true, choice: "spec_rule", node_set: "demo", source: "jev" });
+  });
+
+  it("files a sure preference under user_context", async () => {
+    const { output } = await judge(
+      { text: "...", project: "demo" },
+      deps(async () => jevWith({ preference: 0.65, decision: 0.3, command: 0.05 })),
+    );
+    expect(output).toMatchObject({ save: true, choice: "preference", node_set: "user_context" });
+  });
+
+  it("keeps an unsure preference with the project", async () => {
+    const { output } = await judge(
+      { text: "...", project: "demo" },
+      deps(async () => jevWith({ preference: 0.5, decision: 0.3, spec_rule: 0.15, command: 0.05 })),
+    );
+    expect(output).toMatchObject({ save: true, choice: "decision", node_set: "demo" });
+  });
+
+  it("reads both thresholds from the environment", () => {
+    const env = { VERDICTS: {}, AI: { run: async () => ({}) }, DROP_THRESHOLD: "0.9", ROUTE_THRESHOLD: "0.7" } as unknown as Env;
+    expect(gateDeps(env)).toMatchObject({ dropThreshold: 0.9, routeThreshold: 0.7 });
+    expect(gateDeps({ VERDICTS: {}, AI: env.AI } as unknown as Env)).toMatchObject({ dropThreshold: 0.85, routeThreshold: 0.6 });
   });
 });
 

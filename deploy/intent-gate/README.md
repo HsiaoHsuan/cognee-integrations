@@ -4,7 +4,7 @@
 規格來自 `HANDOFF.md`（Intent Gate：用 TypeSafe JEV 判斷 prompt 意圖），做成一個多個 hook／agent 可以共用的 Cloudflare Worker。
 
 ```
-prompt ─▶ 規則層 ─▶ Jev（只回 11 個固定標籤 + 機率）─▶ 驗證 ─▶ 信心門檻 ─▶ 查表 ─▶ 存／丟 + node_set
+prompt ─▶ 規則層 ─▶ Jev（只回 11 個固定標籤 + 機率）─▶ 驗證 ─▶ 「丟」類機率加總 ─▶ 查表 ─▶ 存／丟 + node_set
            │                         └──────── 任何失敗或沒把握 ────────▶ 照舊存（fail-open）
            └─ 好／繼續／ok、單獨一個 /指令：直接判，不呼叫 Jev
               是／不是／no／不要：只有沒有前一輪回覆時才直接判；有的話交給 Jev（可能是在回答問題）
@@ -29,11 +29,24 @@ prompt ─▶ 規則層 ─▶ Jev（只回 11 個固定標籤 + 機率）─▶
   "key": "sess:prompt"  // 選填：同一輪共用判斷用，見下
 }
 // →
-{ "save": true, "choice": "spec_rule", "confidence": 0.89, "node_set": "ffmpeg", "source": "jev" }
+{ "save": true, "choice": "spec_rule", "confidence": 0.94, "node_set": "ffmpeg", "source": "jev" }
 ```
 
 - `save`、`node_set` 一律由 `choice` 查表推出，三者不會互相矛盾。
-- `source`：`rule`（規則層）、`jev`、`fallback`（Jev 失敗或信心低於門檻，照舊存：`save=true`、`choice="project_fact"`、`confidence=0`）。
+- `source`：`rule`（規則層）、`jev`、`fallback`（Jev 失敗，或「存」「丟」兩邊都不夠確定，照舊存：`save=true`、`choice="project_fact"`、`confidence=0`）。
+- `confidence`：Jev 判斷時是**所選那一邊**（存或丟）的機率加總，不是 `choice` 單一標籤的機率；規則層判的是 1，fallback 是 0。
+
+### 怎麼決定存或丟
+
+Jev 對 11 個標籤各給一個機率。真正要決定的是「存還是丟」，所以把兩邊各自加總，而不是只看最高的那一個標籤夠不夠確定：
+
+1. 6 個「丟」類標籤加總 ≥ `DROP_THRESHOLD`（預設 0.85）→ 丟，`choice` 是其中機率最高的。
+2. 否則，如果「存」類加總比「丟」類小 → 兩邊都不確定，照舊存（`fallback`，`debug.fallback_reason="uncertain"`）。
+3. 否則存，`choice` 是「存」類中機率最高的；只有 `preference` 自己 ≥ `ROUTE_THRESHOLD`（預設 0.6）才放 `user_context`，不然改用次高的專案類標籤，放專案。
+
+例：`command 0.53、chitchat 0.36、question 0.06` —— 沒有任何單一標籤超過 0.8，但「丟」類加總 0.95，所以丟。舊版（只看最高標籤 ≥ 0.8）會把這句照舊存。
+
+`?debug=1` 的 `debug.p_drop` 是「丟」類加總，`debug.raw.probabilities` 是 Jev 原始的 11 個機率。
 - `text` 空白或不是字串 → `400`，不呼叫 Jev。
 - 加 `?debug=1` 會多回一個 `debug` 欄位（Jev 原始的 choice／機率、fallback 原因、耗時），給考卷和除錯用。
 
@@ -65,7 +78,8 @@ Claude Code 同一個事件的 hook 是平行跑的，沒有先後順序，hook 
 | `DECIDER_PROVIDER` | `cloudflare` | `cloudflare`＝Workers AI binding（不用 key，Unified Billing、不在免費額度）；`typesafe`＝直接打 `api.typesafe.ai` |
 | `DECIDER_MODEL` | `typesafe/jev` | Workers AI 的模型 ID。Workers AI 目前沒有可固定版本的 ID，模型更新時判斷結果可能會變；`?debug=1` 回應裡的 `model` 會記錄實際用的版本 |
 | `TYPESAFE_MODEL` | `jev-1.13.0` | `typesafe` provider 用。固定版本，不用 `jev-latest`：門檻是用這一版測出來的，換版前先重跑考卷 |
-| `CONFIDENCE_THRESHOLD` | `0.8` | 低於這個信心就不採信，照舊存 |
+| `DROP_THRESHOLD` | `0.85` | 「丟」類 6 個標籤的機率加總到這個值才丟；不到就存 |
+| `ROUTE_THRESHOLD` | `0.6` | `preference` 自己的機率到這個值才放 `user_context`；不到就放專案 |
 | `DEFAULT_PROJECT_NODE_SET` | `project` | 呼叫端沒給 `project` 時用 |
 | `VERDICT_TTL_SECONDS` | `86400` | 帶 key 的判斷保留多久 |
 
@@ -135,7 +149,7 @@ python3 eval/run_exam.py exam.jsonl --out gate.results.jsonl
 python3 eval/run_exam.py exam.jsonl --judge haiku --out haiku.results.jsonl   # 基準線
 ```
 
-報表的重點是 **keep recall**（該存的有沒有被存到），其次才是 precision；`LOST` 清單列出每一句被誤丟的；最後有信心門檻掃描，用來決定 `CONFIDENCE_THRESHOLD`。
+報表的重點是 **keep recall**（該存的有沒有被存到），其次才是 precision；`LOST` 清單列出每一句被誤丟的；最後有 `DROP_THRESHOLD` 掃描：用每句 Jev 原始的「丟」類加總，在本機重算不同門檻下的結果，不用再呼叫 Jev。
 `exam.jsonl` 和結果檔是你真實的 prompt，不要 commit 到公開 repo。
 
 ## 跟原始規格（HANDOFF，未收錄）不一樣的地方
@@ -145,7 +159,7 @@ python3 eval/run_exam.py exam.jsonl --judge haiku --out haiku.results.jsonl   # 
 | plugin 直接呼叫 Jev | plugin 呼叫這個 Worker，Worker 呼叫 Jev | 多個 hook／agent 共用同一個判斷和同一份 Jev 金鑰；`DECIDER_*`、`TYPESAFE_*` 設在 Worker 上 |
 | `/` 開頭一律當指令丟掉 | 只有整句就是一個 `/名稱`（如 `/clear`）才由規則層判；後面還有字的交給 Jev | `/tmp 不要放暫存檔`、`/workspaces/ffmpeg/a.png 這裡跑版` 這種以路徑開頭的 prompt 長得跟指令一樣，而規則層判錯沒有 fail-open 可以救 |
 | 規則層擋空白 | 空白回 `400` | HANDOFF 的「約束」一節說空白是呼叫端錯誤要 raise，兩處寫法不同，取較嚴格的 |
-| 信心低於門檻 → 照舊存 | 同，輸出統一成 fallback 形狀；另外「丟」類標籤跟「存」類標籤機率打平時也照舊存 | 這樣 `save` 才能永遠由 `choice` 查表推出 |
+| 信心低於門檻 → 照舊存 | 看「丟」類機率加總（`DROP_THRESHOLD`），不看單一標籤的信心；兩邊都不確定時照舊存，輸出統一成 fallback 形狀 | 單一標籤的信心會在「指令／閒聊」這種兩個都該丟的標籤之間被分掉，結果該丟的被存下來（線上 2026-10-14 的三筆 fallback 都是這樣） |
 | 插入點在 `remember_pending_prompt` 之前，丟就不暫存 | 先暫存、再判斷，Stop 時才決定存不存 | 上游的 Stop hook 找不到暫存的 prompt 時，仍會把回答存成一筆「問題是空字串」的 QA；而且判斷變慢時 Stop 可能先到 |
 | 重試「最多 3 次」 | 最多重試 3 次（共 4 次嘗試），間隔 500／1000／2000ms | 照字面 |
 
