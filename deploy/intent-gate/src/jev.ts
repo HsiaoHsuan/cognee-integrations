@@ -5,8 +5,13 @@ import { INTENTS, type Intent, type IntentInput } from "./types";
 
 export const MAX_TEXT_CHARS = 4000;
 export const MAX_CONTEXT_CHARS = 1200;
-export const TIMEOUT_MS = 25_000;
-export const MAX_RETRIES = 3;
+// The plugin client waits 30s (INTENT_GATE_TIMEOUT). The whole judgement,
+// retries included, must finish well inside that: a verdict reached after the
+// caller gave up would be stored for the turn while the caller had already
+// kept the prompt, and later readers of the same key would be told otherwise.
+export const TIMEOUT_MS = 10_000;
+export const MAX_RETRIES = 1;
+export const DEADLINE_MS = 20_000;
 export const RETRY_BASE_MS = 500;
 const RETRYABLE_STATUS = new Set([429, 503, 529]);
 
@@ -122,10 +127,16 @@ export interface RetryOptions {
   retries?: number;
   baseDelayMs?: number;
   timeoutMs?: number;
+  /** Budget for all attempts and backoff together. */
+  deadlineMs?: number;
+  now?: () => number;
   sleep?: (ms: number) => Promise<void>;
 }
 
-/** Retries only JevError.retryable (429/503/529), with 500ms × 2^n backoff. */
+/**
+ * Retries only JevError.retryable (429/503/529), with 500ms × 2^n backoff,
+ * and never past the overall deadline: each attempt gets what is left of it.
+ */
 export async function callWithRetry(
   call: JevCall,
   body: JevRequest,
@@ -135,17 +146,22 @@ export async function callWithRetry(
   const base = opts.baseDelayMs ?? RETRY_BASE_MS;
   const timeoutMs = opts.timeoutMs ?? TIMEOUT_MS;
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const now = opts.now ?? Date.now;
+  const deadline = now() + (opts.deadlineMs ?? DEADLINE_MS);
 
   for (let attempt = 0; ; attempt++) {
     try {
-      const response = await withTimeout(call, body, timeoutMs);
+      const remaining = deadline - now();
+      if (remaining <= 0) throw new JevError("deadline exceeded", false);
+      const response = await withTimeout(call, body, Math.min(timeoutMs, remaining));
       return { response, attempts: attempt + 1 };
     } catch (err) {
       const retryable = err instanceof JevError && err.retryable;
-      if (!retryable || attempt >= retries) {
+      const delay = base * 2 ** attempt;
+      if (!retryable || attempt >= retries || now() + delay >= deadline) {
         throw Object.assign(err instanceof Error ? err : new JevError(errText(err), false), { attempts: attempt + 1 });
       }
-      await sleep(base * 2 ** attempt);
+      await sleep(delay);
     }
   }
 }

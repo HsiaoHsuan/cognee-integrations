@@ -37,7 +37,7 @@ export async function judge(input: IntentInput, deps: GateDeps): Promise<JudgeRe
   const started = now();
   const log = deps.log ?? (() => {});
 
-  const ruled = ruleVerdict(input.text);
+  const ruled = ruleVerdict(input.text, input.context);
   if (ruled) {
     return { output: decide(ruled, 1, "rule", input.project, deps.defaultProjectNodeSet), debug: {} };
   }

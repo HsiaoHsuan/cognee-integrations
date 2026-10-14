@@ -176,6 +176,41 @@ def _resolve_memory_sharing() -> str:
     return f"separated ({reason})"
 
 
+def _resolve_intent_gate(timeout: float = 3.0) -> str:
+    """Whether the intent gate filters auto-capture, and what limits it.
+
+    Off by default. When on, a missing URL or token means every prompt is
+    kept (the client fails open), and without project node sets a
+    ``preference`` verdict cannot be filed under ``user_context``: the turn is
+    kept in the project like any other.
+    """
+    import _intent_gate
+    import _plugin_common  # noqa: F401  (loads ~/.cognee/.env first)
+
+    if not _intent_gate.judge_enabled():
+        return "off"
+    url = os.environ.get("INTENT_GATE_URL", "").strip().rstrip("/")
+    if not url or not os.environ.get("INTENT_GATE_TOKEN", "").strip():
+        return "on, but INTENT_GATE_URL / INTENT_GATE_TOKEN is not set (every prompt is kept)"
+    try:
+        with urllib.request.urlopen(url + "/health", timeout=timeout) as resp:
+            health = json.loads(resp.read().decode("utf-8"))
+    except Exception as exc:
+        return f"on, but {url} is unreachable ({type(exc).__name__}; every prompt is kept)"
+    if not isinstance(health, dict):
+        health = {}
+    if health.get("problem"):
+        return f"on, but the gate is misconfigured: {health['problem']} (every prompt is kept)"
+    status = f"on ({health.get('provider') or '?'} {health.get('model') or ''})".replace(" )", ")")
+    setting = os.environ.get("COGNEE_PROJECT_NODE_SET", "").strip().lower()
+    if not setting or setting in ("0", "false", "off", "no"):
+        status += (
+            " — COGNEE_PROJECT_NODE_SET is off, so preferences are not filed under"
+            " user_context; set it to auto to enable"
+        )
+    return status
+
+
 def _check_health(server_url: str, timeout: float = 5.0) -> dict:
     """Probe GET /health and return reachability + latency.
 
@@ -394,6 +429,7 @@ def collect_report() -> dict:
         "embedding_model": embedding_model,
         "embedding_dimensions": embedding_dimensions,
         "circuit_breaker": circuit_breaker,
+        "intent_gate": _resolve_intent_gate(),
     }
 
 
@@ -412,6 +448,7 @@ _DISPLAY_ORDER = [
     ("Embedding Model", "embedding_model"),
     ("Embedding Dims", "embedding_dimensions"),
     ("Circuit Breaker", "circuit_breaker"),
+    ("Intent Gate", "intent_gate"),
 ]
 
 

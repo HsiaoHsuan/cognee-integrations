@@ -10,7 +10,7 @@
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["VerdictStore"] }],
   "vars": {
     "DECIDER_PROVIDER": "typesafe",
-    "TYPESAFE_MODEL": "jev-latest",
+    "TYPESAFE_MODEL": "jev-1.13.0",
     "CONFIDENCE_THRESHOLD": "0.5",
     "DEFAULT_PROJECT_NODE_SET": "project"
   }

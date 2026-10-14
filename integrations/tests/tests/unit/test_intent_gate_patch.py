@@ -180,6 +180,35 @@ def test_dropped_prompt_is_marked_and_not_counted(prompt_hook, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("choice", ["question", "bug_report"])
+def test_answer_bearing_prompt_is_not_reported_as_dropped(prompt_hook, monkeypatch, choice):
+    """Stop keeps these turns for the answer, so the prompt hook must not say otherwise."""
+    monkeypatch.setenv("COGNEE_CAPTURE_JUDGE", "true")
+    verdict = {**DROP, "choice": choice}
+    monkeypatch.setattr(prompt_hook.gate_client, "judge", lambda *a, **k: dict(verdict))
+    asyncio.run(prompt_hook._store("為什麼拉取段之後就點不到了", prompt_hook.payload))
+    assert _pending(prompt_hook)["gate"]["choice"] == choice
+    assert prompt_hook.counted == ["prompt"]
+    names = [event for event, _ in prompt_hook.events]
+    assert "prompt_pending" in names and "prompt_dropped" not in names
+
+
+@pytest.mark.parametrize(
+    "gate, drops",
+    [
+        (None, False),
+        ({}, False),
+        ({"save": True, "choice": "spec_rule"}, False),
+        ({"save": False, "choice": "command"}, True),
+        ({"save": False, "choice": "ack"}, True),
+        ({"save": False, "choice": "question"}, False),
+        ({"save": False, "choice": "bug_report"}, False),
+    ],
+)
+def test_drops_turn_is_the_one_rule_both_hooks_use(prompt_hook, gate, drops):
+    assert prompt_hook.gate_client.drops_turn(gate) is drops
+
+
 def test_kept_project_prompt_uses_the_default_route(prompt_hook, monkeypatch):
     monkeypatch.setenv("COGNEE_CAPTURE_JUDGE", "true")
     monkeypatch.setattr(prompt_hook.gate_client, "judge", lambda *a, **k: dict(KEEP))
@@ -360,3 +389,62 @@ def test_a_verdict_is_ignored_when_the_host_names_no_turn(stop_hook):
         no_turn,
     )
     assert entry["question"] == "CI 過了就 merge"
+
+
+# ---- doctor: what limits the gate ------------------------------------------
+
+
+@pytest.fixture
+def doctor(suite, isolated_modules, monkeypatch):
+    for name in ("INTENT_GATE_URL", "INTENT_GATE_TOKEN", "COGNEE_PROJECT_NODE_SET"):
+        monkeypatch.delenv(name, raising=False)
+    return isolated_modules(suite, "doctor")
+
+
+def _gate_health(monkeypatch, doctor, body):
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps(body).encode()
+
+    monkeypatch.setattr(doctor.urllib.request, "urlopen", lambda url, timeout: Resp())
+
+
+def test_doctor_gate_off_by_default(doctor, monkeypatch):
+    monkeypatch.delenv("COGNEE_CAPTURE_JUDGE", raising=False)
+    assert doctor._resolve_intent_gate() == "off"
+
+
+def test_doctor_gate_without_url_keeps_everything(doctor, monkeypatch):
+    monkeypatch.setenv("COGNEE_CAPTURE_JUDGE", "true")
+    assert "INTENT_GATE_URL / INTENT_GATE_TOKEN is not set" in doctor._resolve_intent_gate()
+
+
+def test_doctor_gate_reports_a_misconfigured_worker(doctor, monkeypatch):
+    monkeypatch.setenv("COGNEE_CAPTURE_JUDGE", "true")
+    monkeypatch.setenv("INTENT_GATE_URL", "https://gate.example")
+    monkeypatch.setenv("INTENT_GATE_TOKEN", "t")
+    _gate_health(monkeypatch, doctor, {"ok": True, "problem": "the AI binding is missing"})
+    assert "misconfigured: the AI binding is missing" in doctor._resolve_intent_gate()
+
+
+def test_doctor_gate_warns_preferences_need_project_node_sets(doctor, monkeypatch):
+    monkeypatch.setenv("COGNEE_CAPTURE_JUDGE", "true")
+    monkeypatch.setenv("INTENT_GATE_URL", "https://gate.example")
+    monkeypatch.setenv("INTENT_GATE_TOKEN", "t")
+    _gate_health(
+        monkeypatch,
+        doctor,
+        {"ok": True, "provider": "typesafe", "model": "jev-1.13.0", "problem": None},
+    )
+    status = doctor._resolve_intent_gate()
+    assert status.startswith("on (typesafe jev-1.13.0)")
+    assert "not filed under user_context" in status
+
+    monkeypatch.setenv("COGNEE_PROJECT_NODE_SET", "auto")
+    assert doctor._resolve_intent_gate() == "on (typesafe jev-1.13.0)"

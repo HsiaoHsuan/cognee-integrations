@@ -139,7 +139,14 @@ try {
   const call = api(base);
 
   console.log("auth");
-  check("/health needs no token", (await api(base, null)("/health")).status === 200);
+  const health = await api(base, null)("/health");
+  check("/health needs no token", health.status === 200);
+  check(
+    "/health reports the decider without secrets",
+    health.json?.ready === true && health.json?.provider === "typesafe" && health.json?.model === "jev-1.13.0" &&
+      health.json?.problem === null && !JSON.stringify(health.json).includes("stub-key"),
+    JSON.stringify(health.json),
+  );
   check("no token -> 401", (await api(base, null)("/v1/judge", { method: "POST", body: { text: "hello there" } })).status === 401);
   check("wrong token -> 401", (await api(base, "nope")("/v1/judge", { method: "POST", body: { text: "hello there" } })).status === 401);
   check("unauthorized requests never reach Jev", calls.length === 0);
@@ -153,7 +160,7 @@ try {
   check("choice_reply is dropped", r.json?.save === false && r.json?.choice === "choice_reply", JSON.stringify(r.json));
   check("context reaches Jev as previous_assistant_reply", calls.at(-1).body.state.previous_assistant_reply === "要 A 分頁式還是 B？匯出 1 或 2？");
   check("Jev request carries model, bearer key and the 11 criteria",
-    calls.at(-1).body.model === "jev-latest" && calls.at(-1).auth === "Bearer stub-key" && calls.at(-1).path === "/v1/systemone" &&
+    calls.at(-1).body.model === "jev-1.13.0" && calls.at(-1).auth === "Bearer stub-key" && calls.at(-1).path === "/v1/systemone" &&
     same(Object.keys(calls.at(-1).body.questions.intent.criteria), INTENTS));
   r = await call("/v1/judge", { method: "POST", body: { text: "以後 commit 訊息一律用英文", project: "ffmpeg" } });
   check("preference goes to user_context", r.json?.save === true && r.json?.node_set === "user_context", JSON.stringify(r.json));
