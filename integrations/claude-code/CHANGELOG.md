@@ -10,6 +10,15 @@ Code only offers an update when that string changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.6-fork.2]
+
+### Changed
+- **One enrichment pass per distill run.** Each distilled memory used to trigger
+  the server's improve on its own, so a run that kept seven memories ran seven
+  enrichment passes. Writes now skip it, and one improve runs over the run's node
+  sets after their cognify finishes (`COGNEE_DISTILL_COGNIFY_WAIT`, default 600
+  seconds), still without sending the session.
+
 ## [1.6.6-fork.1]
 
 ### Changed

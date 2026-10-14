@@ -169,12 +169,17 @@ def test_run_writes_tagged_memories_once(distill, monkeypatch, tmp_path):
         "_remember",
         lambda ds, m, tags: written.append((ds, distill.content(m), tags)) or {"ok": True},
     )
+    enriched = []
+    monkeypatch.setattr(
+        distill, "_enrich", lambda ds, did, tags: enriched.append(tags) or {"ok": True}
+    )
     monkeypatch.delenv("COGNEE_PROJECT_NODE_SET", raising=False)
 
     assert distill.run("ds", "sess", trigger="final")["ok"]
     ((dataset, text, tags),) = written
     assert dataset == "ds" and text == "一律用 pnpm 管理套件\nWhy: CI 會壞"
     assert tags[0].startswith("project-my-app-") and tags[1] == "decision"
+    assert enriched == [[tags[0]]]  # one improve for the run, over the project's node set
 
     # Unchanged transcript: nothing is distilled or written again.
     assert distill.run("ds", "sess", trigger="idle")["ok"]
@@ -228,6 +233,7 @@ def test_run_keeps_unwritten_for_retry(distill, monkeypatch, tmp_path):
         },
     )
     monkeypatch.setattr(distill, "_remember", lambda *a: {"ok": False, "error": "unreachable"})
+    monkeypatch.setattr(distill, "_enrich", lambda *a: {"ok": True})
     result = distill.run("ds", "sess", trigger="final")
     assert not result["ok"] and result["reason"] == "failed"
     calls = []
@@ -303,3 +309,64 @@ def test_a_new_transcript_is_read_from_the_start(distill, tmp_path):
     state = distill._load("sess")
     assert "turns_done" not in state and "size" not in state
     assert state["kept"] == [{"text": "已存的一條"}]
+
+
+def test_writes_skip_the_per_write_improve(suite, isolated_modules, monkeypatch):
+    if suite.name != "claude-code":
+        pytest.skip("self_improvement=false is sent by session distill, Claude Code only")
+    rh = isolated_modules(suite, "_remember_http")
+    monkeypatch.setenv("COGNEE_REMEMBER_WAIT_SECONDS", "0")  # no status polling after the POST
+    sent = {}
+
+    class _Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b'{"dataset_id": "d1"}'
+
+    def opener(req, timeout):
+        if req.data is not None:  # the remember POST, not the status polls after it
+            sent["body"] = req.data
+        return _Resp()
+
+    rh.do_remember("http://s", "k", "x", "ds", ["a"], opener=opener, self_improvement=False)
+    assert b'name="self_improvement"\r\n\r\nfalse' in sent["body"]
+    rh.do_remember("http://s", "k", "x", "ds", ["a"], opener=opener)
+    assert b"self_improvement" not in sent["body"]  # left to the server default
+
+
+def test_enrich_waits_then_improves_once_without_a_session(distill, monkeypatch):
+    import _plugin_common
+    import _remember_http
+
+    calls = []
+    monkeypatch.setattr(
+        _remember_http, "_poll_status", lambda *a, **k: calls.append("wait") or "completed"
+    )
+    monkeypatch.setattr(
+        _plugin_common,
+        "_json_http_request",
+        lambda path, payload, **k: calls.append((path, payload)) or {"ok": True},
+    )
+    assert distill._enrich("ds", "d1", ["project-a", "user_context"])["ok"]
+    assert calls[0] == "wait"
+    ((path, payload),) = calls[1:]
+    assert path == "/api/v1/improve"
+    assert payload["node_name"] == ["project-a", "user_context"]
+    assert payload["dataset_id"] == "d1"
+    assert "session_ids" not in payload
+
+
+def test_enrich_skips_the_improve_when_cognify_failed(distill, monkeypatch):
+    import _plugin_common
+    import _remember_http
+
+    monkeypatch.setattr(_remember_http, "_poll_status", lambda *a, **k: "errored")
+    monkeypatch.setattr(
+        _plugin_common, "_json_http_request", lambda *a, **k: pytest.fail("must not improve")
+    )
+    assert distill._enrich("ds", "d1", ["project-a"]) == {"ok": False, "error": "cognify errored"}

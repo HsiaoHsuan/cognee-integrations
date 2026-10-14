@@ -32,6 +32,10 @@ from pathlib import Path
 _FALSE = {"0", "false", "no", "off"}
 DEFAULT_MODEL = "sonnet"
 CLAUDE_TIMEOUT = 900
+# How long to wait for the writes' background cognify before the one improve,
+# and the read timeout of that improve's submit (it runs in the background).
+ENRICH_WAIT_SECONDS = 600.0
+ENRICH_SUBMIT_TIMEOUT = 120.0
 
 # Each type: what it is, the neighbouring type to prefer instead (not_for), and
 # examples. bug_fix needs the answers, which is why it is judged per session.
@@ -672,6 +676,8 @@ def _remember(dataset: str, memory: dict, tags: list[str]) -> dict:
         tags,
         dataset_id=dataset_id_for(dataset),
         timeout=_remember_http._remember_timeout(),
+        # One improve for the whole run instead of one per memory (see _enrich).
+        self_improvement=False,
     )
     if result == _remember_http.UNREACHABLE:
         return {"ok": False, "error": "unreachable"}
@@ -681,7 +687,39 @@ def _remember(dataset: str, memory: dict, tags: list[str]) -> dict:
             "error": str(result.get("error"))[:200],
             "status": result.get("status"),
         }
-    return {"ok": True}
+    return {"ok": True, "dataset_id": str(result.get("dataset_id") or "")}
+
+
+def _enrich(dataset: str, dataset_id: str, tags: list[str]) -> dict:
+    """One improve over the node sets this run wrote, without any session.
+
+    The writes skip the server's per-write improve, so a run of seven memories
+    costs one enrichment pass instead of seven. No session id is sent: the
+    session itself never reaches the graph, only what distill kept. Waits for
+    the background cognify of the writes first, or the pass would find nothing.
+    """
+    import _remember_http
+    from _dataset_access import write_fields
+    from _plugin_common import _json_http_request, resolved_http_endpoint_auth
+
+    service_url, api_key = resolved_http_endpoint_auth()
+    if dataset_id and _remember_http._background_flag() == "true":
+        waited = _remember_http._poll_status(
+            service_url,
+            api_key,
+            dataset_id,
+            _remember_http._float_env("COGNEE_DISTILL_COGNIFY_WAIT", ENRICH_WAIT_SECONDS),
+        )
+        if waited in ("errored", "timeout"):
+            return {"ok": False, "error": f"cognify {waited}"}
+    payload = {**write_fields(dataset), "node_name": tags, "run_in_background": True}
+    if dataset_id:
+        payload["dataset_id"] = dataset_id
+    try:
+        _json_http_request("/api/v1/improve", payload, timeout=ENRICH_SUBMIT_TIMEOUT)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:200]}
+    return {"ok": True, "error": ""}
 
 
 def _context(earlier: list[str]) -> list[str]:
@@ -760,9 +798,12 @@ def run(dataset: str, session_id: str, *, trigger: str) -> dict:
             )
             return {"ok": False, "reason": "failed", "error": str(exc)[:300]}
         failed = 0
+        written_tags: list[str] = []
+        dataset_id = ""
         for memory in result["memories"]:
             tags = node_sets(memory, tag)
             outcome = _remember(dataset, memory, tags)
+            dataset_id = dataset_id or outcome.get("dataset_id", "")
             if not outcome["ok"]:
                 failed += 1
                 hook_log(
@@ -770,6 +811,15 @@ def run(dataset: str, session_id: str, *, trigger: str) -> dict:
                 )
                 continue
             kept.append({"text": memory["text"], "type": memory["type"], "node_set": tags})
+            written_tags += [t for t in tags[:1] if t not in written_tags]
+        if written_tags:
+            enriched = _enrich(dataset, dataset_id, written_tags)
+            if not enriched["ok"]:
+                # The memories are written and recallable; only the enrichment
+                # is missing, and the next run's pass covers the same node sets.
+                hook_log(
+                    "distill_enrich_failed", {"session": session_id, "error": enriched["error"]}
+                )
         state["kept"] = kept
         if not failed:
             state["size"] = size

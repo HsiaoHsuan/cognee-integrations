@@ -111,6 +111,7 @@ EVENT_NAMES = {
     "hook:dataset_ensured": "dataset.ensured",
     "hook:dataset_switched": "dataset.switched",
     "hook:distill_done": "distill.done",
+    "hook:distill_enrich_failed": "distill.enrich_failed",
     "hook:distill_failed": "distill.failed",
     "hook:distill_memory_failed": "distill.memory_failed",
     "hook:distill_record_failed": "distill.record_failed",

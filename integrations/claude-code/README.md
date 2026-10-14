@@ -1019,6 +1019,7 @@ win over the shared file. Changes apply when a new hook process starts.
 | `COGNEE_CAPTURE_DENY_TOOLS` | empty | Same syntax, applied after the allowlist: a matching call is not captured, e.g. `Bash(rg:*)\|Bash(grep:*)\|Bash(cat:*)` keeps every Bash call except search and inspection. |
 | `COGNEE_CAPTURE_DENY_PATHS` | sensitive file patterns | Comma-separated patterns or a JSON array extending the built-in `.env`, credential and private-key exclusions. |
 | `COGNEE_DISTILL` | `true` | At idle and session end, keep only distilled memories (decisions, preferences, rules, facts, feature requests, bug fixes), each filed under a node set. `false` bridges the whole session with improve instead. |
+| `COGNEE_DISTILL_COGNIFY_WAIT` | `600` | Seconds a distill run waits for its writes' background cognify before the one enrichment pass (improve over the node sets it wrote, without the session). |
 | `COGNEE_DISTILL_MODEL` | `sonnet` | `claude --model` value for the distill calls: an alias (`haiku`, `sonnet`, `opus`) or a full model id. A value that cannot be a model name falls back to `sonnet`. |
 | `COGNEE_CAPTURE_REDACT` | `true` | Redacts common credentials, authorization values, database URLs and private-key blocks before truncation, persistence or upload. |
 | `COGNEE_CAPTURE_REDACT_PATTERNS` | empty | JSON array of additional regular expressions. Invalid expressions prevent the affected content from being captured. |
