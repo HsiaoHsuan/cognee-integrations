@@ -20,7 +20,8 @@ export interface IntentInput {
 export interface IntentOutput {
   save: boolean;
   choice: Intent;
-  /** 0–1. Always 1 when a rule decided, 0 on fallback. */
+  /** 0–1. For a Jev verdict, the summed probability of the side taken (keep or
+   *  drop), not of `choice` alone. Always 1 when a rule decided, 0 on fallback. */
   confidence: number;
   /** Where to store when save=true; null when save=false. */
   node_set: string | null;
@@ -34,6 +35,8 @@ export interface JudgeDebug {
   fallback_reason?: string;
   /** What Jev actually answered, even when the verdict was not trusted. */
   raw?: { choice: Intent; confidence: number; probabilities: Record<string, number> };
+  /** Sum of Jev's probabilities over the drop intents: what keep/drop was decided on. */
+  p_drop?: number;
   model?: string;
   usage?: unknown;
   attempts?: number;

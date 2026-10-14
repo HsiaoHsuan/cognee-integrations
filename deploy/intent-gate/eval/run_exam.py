@@ -29,7 +29,7 @@ from pathlib import Path
 # Same client the plugin ships, so the exam scores exactly what the hook sends.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "integrations" / "claude-code" / "scripts"))
 import _intent_gate as intent_gate  # noqa: E402
-from _intent_gate import INTENTS, SAVE_INTENTS  # noqa: E402
+from _intent_gate import DROP_INTENTS, INTENTS, SAVE_INTENTS  # noqa: E402
 
 DESCRIPTIONS = {
     "spec_rule": "Product rule, UI spec, or how a feature should behave",
@@ -80,6 +80,7 @@ def judge_gate(row: dict) -> dict:
     )
     debug = verdict.get("debug") or {}
     raw = debug.get("raw") or {}
+    probabilities = raw.get("probabilities") or {}
     return {
         "save": verdict["save"],
         "choice": verdict["choice"],
@@ -87,6 +88,8 @@ def judge_gate(row: dict) -> dict:
         "source": verdict["source"],
         "raw_choice": raw.get("choice"),
         "raw_confidence": raw.get("confidence"),
+        # What the gate decides keep/drop on; lets the sweep replay any threshold.
+        "raw_p_drop": round(sum(probabilities.get(k, 0) for k in DROP_INTENTS), 4) if probabilities else None,
         "note": debug.get("fallback_reason") or "; ".join(problems),
     }
 
@@ -185,6 +188,16 @@ def report(results: list[dict]) -> bool:
         for (want, got), c in wrong.most_common(8):
             print(f"  {c:>3}  {want} -> {got}")
 
+    mass = [r for r in results if r.get("raw_p_drop") is not None]
+    if mass:
+        print(f"\nDROP_THRESHOLD sweep ({len(mass)} prompts Jev answered; a prompt is dropped when its drop intents together reach the threshold)")
+        print("  threshold  keep recall   keep precision   dropped")
+        for t in (0.6, 0.7, 0.8, 0.85, 0.9, 0.95):
+            s = keep_drop(mass, lambda r, t=t: r["raw_p_drop"] < t)
+            print(f"  {t:>6.2f}     {pct(s['hit'], s['should']):<13} {pct(s['hit'], s['kept']):<16} {pct(len(mass) - s['kept'], len(mass))}")
+        return not lost
+
+    # Judges without per-intent probabilities (the haiku baseline): sweep their own confidence.
     sweep = [r for r in results if r.get("raw_choice") and r.get("raw_confidence") is not None]
     if sweep:
         print(f"\nconfidence threshold sweep ({len(sweep)} prompts Jev answered; below the threshold a prompt is kept)")

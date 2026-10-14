@@ -310,6 +310,18 @@ class ScoringTest(unittest.TestCase):
         self.assertIn("0/1 (0%)", lines["0.5"])
         self.assertIn("1/1 (100%)", lines["0.7"])
 
+    def test_drop_threshold_sweep_replays_the_summed_drop_probability(self):
+        results = [
+            {**result("spec_rule", "spec_rule", True), "raw_p_drop": 0.82},  # lost at 0.8, kept at 0.85
+            {**result("command", "command", False), "raw_p_drop": 0.95},
+        ]
+        _, text = self.report(results)
+        self.assertIn("DROP_THRESHOLD sweep (2 prompts", text)
+        lines = {l.split()[0]: l for l in text.splitlines() if l.strip()[:4] in ("0.80", "0.85")}
+        self.assertIn("0/1 (0%)", lines["0.80"])
+        self.assertIn("1/1 (100%)", lines["0.85"])
+        self.assertNotIn("confidence threshold sweep", text)
+
     def test_multiple_acceptable_labels(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "exam.jsonl"
@@ -339,11 +351,13 @@ class JudgesTest(unittest.TestCase):
         gate = FakeGate()
         self.addCleanup(gate.close)
         gate.reply = (200, {**intent_gate.fallback("p"), "debug": {
-            "fallback_reason": "low_confidence", "raw": {"choice": "command", "confidence": 0.31}}})
+            "fallback_reason": "uncertain", "raw": {"choice": "command", "confidence": 0.31, "probabilities": {
+                **{k: 0.0 for k in intent_gate.INTENTS}, "command": 0.36, "chitchat": 0.2, "spec_rule": 0.44}}}})
         with mock.patch.dict(os.environ, {"INTENT_GATE_URL": gate.url, "INTENT_GATE_TOKEN": "t"}):
             out = run_exam.judge_gate({"text": "CI 過了就 merge", "project": "p"})
         self.assertEqual((out["save"], out["source"], out["raw_choice"], out["raw_confidence"], out["note"]),
-                         (True, "fallback", "command", 0.31, "low_confidence"))
+                         (True, "fallback", "command", 0.31, "uncertain"))
+        self.assertEqual(out["raw_p_drop"], 0.56)
 
     def fake_claude(self, tmp: Path, script: str):
         exe = tmp / "claude"

@@ -153,9 +153,10 @@ try {
 
   console.log("contract (examples from HANDOFF.md)");
   let r = await call("/v1/judge", { method: "POST", body: { text: "反之如果刪除段拉到其他操作段就以操作段為主", project: "ffmpeg" } });
-  check("spec_rule is kept under the project", same(r.json, { save: true, choice: "spec_rule", confidence: 0.86, node_set: "ffmpeg", source: "jev" }), JSON.stringify(r.json));
+  // confidence is the summed probability of the side taken: keep 0.9 + 4 × 0.01, drop 0.9 + 5 × 0.01
+  check("spec_rule is kept under the project", same(r.json, { save: true, choice: "spec_rule", confidence: 0.94, node_set: "ffmpeg", source: "jev" }), JSON.stringify(r.json));
   r = await call("/v1/judge", { method: "POST", body: { text: "CI 過了就 merge" } });
-  check("command is dropped", same(r.json, { save: false, choice: "command", confidence: 0.86, node_set: null, source: "jev" }), JSON.stringify(r.json));
+  check("command is dropped", same(r.json, { save: false, choice: "command", confidence: 0.95, node_set: null, source: "jev" }), JSON.stringify(r.json));
   r = await call("/v1/judge", { method: "POST", body: { text: "B + 2", context: "要 A 分頁式還是 B？匯出 1 或 2？", project: "ffmpeg" } });
   check("choice_reply is dropped", r.json?.save === false && r.json?.choice === "choice_reply", JSON.stringify(r.json));
   check("context reaches Jev as previous_assistant_reply", calls.at(-1).body.state.previous_assistant_reply === "要 A 分頁式還是 B？匯出 1 或 2？");
@@ -216,7 +217,7 @@ try {
   const tools = await client.listTools();
   check("lists judge_intent", tools.tools.length === 1 && tools.tools[0].name === "judge_intent");
   const res = await client.callTool({ name: "judge_intent", arguments: { text: "CI 過了就 merge", project: "joy-app" } });
-  check("tool returns the IntentOutput", same(res.structuredContent, { save: false, choice: "command", confidence: 0.86, node_set: null, source: "jev" }), JSON.stringify(res.structuredContent));
+  check("tool returns the IntentOutput", same(res.structuredContent, { save: false, choice: "command", confidence: 0.95, node_set: null, source: "jev" }), JSON.stringify(res.structuredContent));
   const shared = await client.callTool({ name: "judge_intent", arguments: { text: "anything", key } });
   check("tool shares verdicts by key with HTTP callers", same(shared.structuredContent, burst[0].json));
   const bad = await client.callTool({ name: "judge_intent", arguments: { text: "" } });

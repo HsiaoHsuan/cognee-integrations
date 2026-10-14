@@ -16,7 +16,10 @@ export interface Env {
   TYPESAFE_MODEL?: string;
   /** Override for tests; defaults to https://api.typesafe.ai */
   TYPESAFE_BASE_URL?: string;
-  CONFIDENCE_THRESHOLD?: string;
+  /** Drop only when the drop intents together reach this probability (default 0.85). */
+  DROP_THRESHOLD?: string;
+  /** File under user_context only when `preference` alone reaches this (default 0.6). */
+  ROUTE_THRESHOLD?: string;
   DEFAULT_PROJECT_NODE_SET?: string;
   VERDICT_TTL_SECONDS?: string;
 }
@@ -66,7 +69,8 @@ export function gateDeps(env: Env): GateDeps {
 
   return {
     callJev,
-    threshold: unitNumber(env.CONFIDENCE_THRESHOLD, 0.8),
+    dropThreshold: unitNumber(env.DROP_THRESHOLD, 0.85),
+    routeThreshold: unitNumber(env.ROUTE_THRESHOLD, 0.6),
     defaultProjectNodeSet: env.DEFAULT_PROJECT_NODE_SET?.trim() || "project",
     // Structured line per fallback; shows up in Workers Logs.
     log: (event, detail) => console.log(JSON.stringify({ event, ...detail })),
