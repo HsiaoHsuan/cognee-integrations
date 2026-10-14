@@ -16,3 +16,4 @@
 {"text": "登入頁在 Safari 白屏", "project": "demo", "context": null, "intent": "bug_report"}
 {"text": "這個專案用 pnpm，不要用 npm", "project": "demo", "context": null, "intent": "project_fact|preference|decision"}
 {"text": "先這樣，明天再繼續", "project": "demo", "context": null, "intent": "chitchat|ack"}
+{"text": "好", "project": "demo", "context": "目前用 Redis 做 pub/sub，但 Zeabur 免費方案沒有 Redis。要改用 Postgres 的 LISTEN/NOTIFY 嗎？", "intent": "decision"}

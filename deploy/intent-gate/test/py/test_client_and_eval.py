@@ -261,15 +261,28 @@ def result(intent, choice, save, source="jev", conf=0.9, raw=None, raw_conf=None
 
 
 class CriteriaTest(unittest.TestCase):
-    def test_haiku_baseline_reads_the_same_criteria_as_the_worker(self):
-        """eval/run_exam.py keeps its own copy for the haiku baseline; it must match src/jev.ts."""
-        import re
+    def test_criteria_cover_exactly_the_intents_in_structured_form(self):
+        """src/criteria.json is the one copy: the Worker imports it, the haiku baseline reads it."""
+        criteria = json.loads((ROOT / "src" / "criteria.json").read_text(encoding="utf-8"))
+        self.assertEqual(list(criteria), list(intent_gate.INTENTS))
+        for key, c in criteria.items():
+            with self.subTest(key):
+                self.assertIsInstance(c.get("what"), str)
+                self.assertTrue(c["what"].strip())
+                self.assertIsInstance(c.get("not_for"), str)
+                self.assertIsInstance(c.get("examples"), list)
+                self.assertTrue(1 <= len(c["examples"]) <= 3)
+                self.assertTrue(all(isinstance(e, str) and e.strip() for e in c["examples"]))
+        self.assertEqual(run_exam.CRITERIA, criteria)
 
-        source = (ROOT / "src" / "jev.ts").read_text(encoding="utf-8")
-        block = source[source.index("export const CRITERIA"):source.index("};", source.index("export const CRITERIA"))]
-        worker = dict(re.findall(r'^\s+(\w+): "(.*)",?$', block, flags=re.M))
-        self.assertEqual(set(worker), set(intent_gate.INTENTS))
-        self.assertEqual(worker, run_exam.DESCRIPTIONS)
+    def test_haiku_baseline_renders_one_line_per_intent(self):
+        self.assertEqual(list(run_exam.DESCRIPTIONS), list(intent_gate.INTENTS))
+        c = run_exam.CRITERIA["command"]
+        self.assertEqual(
+            run_exam.DESCRIPTIONS["command"],
+            f"{c['what']}. Not for: {c['not_for']}. Examples: {'; '.join(c['examples'])}",
+        )
+        self.assertTrue(all("\n" not in line for line in run_exam.DESCRIPTIONS.values()))
 
 
 class ScoringTest(unittest.TestCase):
@@ -349,11 +362,11 @@ class ScoringTest(unittest.TestCase):
 
     def test_shipped_exam_is_valid(self):
         rows = run_exam.load_exam(str(ROOT / "eval" / "known_hard.jsonl"))
-        self.assertEqual(len(rows), 18)
+        self.assertEqual(len(rows), 19)
 
     def test_phrasing_exam_is_valid_and_covers_every_intent(self):
         rows = run_exam.load_exam(str(ROOT / "eval" / "phrasings.jsonl"))
-        self.assertEqual(len(rows), 64)
+        self.assertEqual(len(rows), 67)
         firsts = {row["intent"].split("|")[0] for row in rows}
         self.assertEqual(firsts, set(intent_gate.INTENTS))
 

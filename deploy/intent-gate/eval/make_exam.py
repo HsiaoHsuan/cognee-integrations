@@ -29,7 +29,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "integrations" / "claude-code" / "scripts"))
 from _intent_gate import INTENTS, MAX_CONTEXT_CHARS  # noqa: E402
 
-# Mirrors src/rules.ts.
+# Mirrors src/rules.ts, minus the context checks: fillers that the Worker
+# sends to Jev after a question (好, ok, no, 不要...) are skipped here too.
 _FILLER = re.compile(r"^(ok|okay|好|好的|嗯|對|是|繼續|continue|yes|no|thanks|謝謝|go|y|n|lgtm)[!！。. ]*$", re.I)
 _SLASH = re.compile(r"^/[\w:-]+$", re.A)
 
