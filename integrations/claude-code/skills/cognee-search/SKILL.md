@@ -1,6 +1,6 @@
 ---
 name: cognee-search
-description: Search the user's long-term Cognee memory — decisions, standing preferences, product rules, project facts and bug fixes kept from earlier sessions. Use it whenever the answer may depend on something from before this conversation and not visible in it or in the code — "like last time", "what did we decide about X", "why is it done this way", a convention or constraint you are unsure of, or a bug that looks familiar. Memory is not injected automatically, so search instead of guessing.
+description: Search the user's long-term Cognee memory — decisions, standing preferences, product rules, project facts and bug fixes kept from earlier sessions. Use it whenever the answer may depend on something from before this conversation and not visible in it or in the code — "like last time", "what did we decide about X", "why is it done this way", a convention or constraint you are unsure of, or a bug that looks familiar. Search instead of guessing.
 ---
 
 # Cognee Memory Search
@@ -9,7 +9,7 @@ Search the permanent knowledge graph, optionally filtered by node set.
 
 ## When to search
 
-Memory is **not** injected into the conversation on its own (`COGNEE_RECALL_MODE=skill`, the default): reading it is your call, so a turn that needs no memory costs nothing. Search when the answer may hinge on what earlier sessions settled and this conversation does not show:
+Search when the answer may hinge on what earlier sessions settled and this conversation does not show:
 
 - the user points back in time ("like last time", "as we decided", "the usual way")
 - you are about to choose an approach, name, tool or layout the project may already have decided
@@ -18,7 +18,7 @@ Memory is **not** injected into the conversation on its own (`COGNEE_RECALL_MODE
 
 Do not search for things the conversation or the code already answers. One broad query is usually enough.
 
-With `COGNEE_RECALL_MODE=auto` the `UserPromptSubmit` hook instead injects a lookup on every prompt; then search only when that context is not enough.
+If a `UserPromptSubmit` memory block is already in the conversation (`COGNEE_RECALL_MODE=auto`; the default `skill` injects none), search only when it is not enough.
 
 ## What is stored
 
