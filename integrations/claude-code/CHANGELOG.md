@@ -10,6 +10,19 @@ Code only offers an update when that string changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.6-fork.4]
+
+### Changed
+- **Distilled memories are filed as session learnings.** Each one also carries
+  the node sets `session_learnings` and `session_learnings:<session id>` and
+  Cognee's `# Session learning (session <id>)` header, the way the server files
+  the lessons its own improve distills. Since 1.6.6-fork.1 the server no longer
+  distilled sessions (that needs an improve with session ids, which also
+  persists the whole session), so the recap's "what was learned" came up empty
+  and recall could not tell which session a memory came from. Both work again,
+  from the memories distill already keeps; nothing is learned twice.
+  Memories written before this version are not retagged.
+
 ## [1.6.6-fork.3]
 
 ### Changed
