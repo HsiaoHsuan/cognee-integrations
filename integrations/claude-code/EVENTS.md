@@ -111,6 +111,7 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:dataset_ensure_redirect_failed` | `dataset.ensure_redirect_failed` |
 | `hook:dataset_ensured` | `dataset.ensured` |
 | `hook:dataset_switched` | `dataset.switched` |
+| `hook:distill_dedupe_failed` | `distill.dedupe_failed` |
 | `hook:distill_done` | `distill.done` |
 | `hook:distill_failed` | `distill.failed` |
 | `hook:distill_memory_failed` | `distill.memory_failed` |

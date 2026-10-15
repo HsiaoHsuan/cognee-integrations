@@ -9,7 +9,14 @@ import pytest
 def distill(suite, isolated_modules):
     if suite.name != "claude-code":
         pytest.skip("session distill ships with the Claude Code plugin only")
-    return isolated_modules(suite, "_distill")
+    module = isolated_modules(suite, "_distill")
+    # No long-term lookups unless a test asks for them; the real one stays reachable.
+    real = module._recall_lessons
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(module, "_recall_lessons", lambda *a, **k: [])
+    monkeypatch.setattr(module, "real_recall_lessons", real, raising=False)
+    yield module
+    monkeypatch.undo()
 
 
 def _memory(text, *, type_="decision", why=None, evidence="[U1] x", confidence=0.8):
@@ -427,3 +434,76 @@ def test_lesson_tags_and_header_follow_cognee(distill):
         "x (改了沒反應。)\n"
     )
     assert distill.content(_memory("x", why="no reason"), "claude_1").endswith("x (no reason.)\n")
+
+
+def test_recall_lessons_reads_lessons_without_binding_a_session(distill, monkeypatch):
+    import _plugin_common
+
+    sent = {}
+    reply = [
+        {
+            "kind": "graph_completion",
+            "text": (
+                "Context:\n`## Relevant passages\n"
+                "# Session learning (session claude_a)\n\n帳號鎖定固定 30 分鐘 (怕被鎖。)\n\n"
+                "# Session learning (session claude_b)\n\nUse pnpm. (CI broke.)\n`"
+            ),
+        }
+    ]
+    monkeypatch.setattr(
+        _plugin_common,
+        "_json_http_request",
+        lambda path, payload, **k: sent.update(path=path, payload=payload) or reply,
+    )
+    found = distill.real_recall_lessons("ds", "鎖定", ["project-a", "user_context"])
+    assert found == [
+        ("claude_a", "帳號鎖定固定 30 分鐘 (怕被鎖。)"),
+        ("claude_b", "Use pnpm. (CI broke.)"),
+    ]
+    payload = sent["payload"]
+    assert sent["path"] == "/api/v1/recall" and "session_id" not in payload
+    assert payload["scope"] == ["graph"] and payload["only_context"] is True
+    assert payload["node_name"] == ["project-a", "user_context"]
+
+
+def test_drop_known_drops_only_duplicates(distill, monkeypatch):
+    lessons = {
+        "固定 30 分鐘": [("claude_old", "帳號鎖定固定 30 分鐘")],
+        "改用 pnpm": [("claude_old", "用 npm 管理套件"), ("sess", "本 session 自己的")],
+        "全新的事": [],
+    }
+    monkeypatch.setattr(distill, "_recall_lessons", lambda ds, q, scope: lessons[q])
+    prompts = []
+
+    def fake(prompt, model, schema=None):
+        prompts.append(prompt)
+        return {
+            "verdicts": [
+                {"index": 0, "verdict": "duplicate"},
+                {"index": 1, "verdict": "updates"},
+                {"index": 2, "verdict": "new"},
+            ]
+        }
+
+    monkeypatch.setattr(distill, "ask_claude", fake)
+    memories = [_memory("固定 30 分鐘"), _memory("改用 pnpm"), _memory("全新的事")]
+    kept, dropped = distill.drop_known(memories, "ds", "sess", "project-a", "m")
+    assert [m["text"] for m in kept] == ["改用 pnpm", "全新的事"] and dropped == 1
+    (prompt,) = prompts
+    assert "帳號鎖定固定 30 分鐘" in prompt and "用 npm 管理套件" in prompt
+    assert "本 session 自己的" not in prompt  # this session's own lessons are already_kept
+
+
+def test_drop_known_skips_the_model_when_nothing_is_stored(distill, monkeypatch):
+    monkeypatch.setattr(distill, "ask_claude", lambda *a, **k: pytest.fail("no model call"))
+    memories = [_memory("x")]
+    assert distill.drop_known(memories, "ds", "sess", "project-a", "m") == (memories, 0)
+
+
+def test_drop_known_keeps_everything_when_it_fails(distill, monkeypatch):
+    def broken(*a, **k):
+        raise OSError("server down")
+
+    monkeypatch.setattr(distill, "_recall_lessons", broken)
+    memories = [_memory("x"), _memory("y")]
+    assert distill.drop_known(memories, "ds", "sess", "project-a", "m") == (memories, 0)

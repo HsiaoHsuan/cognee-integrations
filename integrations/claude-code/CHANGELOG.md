@@ -10,6 +10,17 @@ Code only offers an update when that string changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.6-fork.5]
+
+### Changed
+- **Distill no longer repeats what earlier sessions stored.** Each candidate is
+  looked up in the project's and the user's long-term lessons (graph recall,
+  context only, no session bound); when any turn up, one model call marks each
+  candidate new, duplicate or updates, and only duplicates are dropped. An update
+  (a changed value, a reversed decision) is still written, and its
+  `effective_date` tells it apart from the one it supersedes. Any failure in the
+  lookup keeps every candidate.
+
 ## [1.6.6-fork.4]
 
 ### Changed
