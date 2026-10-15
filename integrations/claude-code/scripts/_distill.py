@@ -6,8 +6,12 @@ decisions, standing preferences, rules, project facts, feature requests and
 confirmed bug fixes. Each memory is one short sentence with its reason and a
 verbatim quote, filed under a node set so nothing lands uncategorized:
 
-    preference -> ["user_context", "preference"]
-    otherwise  -> [<project tag>, <type>]
+    preference -> ["user_context", "preference", <lesson tags>]
+    otherwise  -> [<project tag>, <type>, <lesson tags>]
+
+The lesson tags are ``session_learnings`` and ``session_learnings:<session id>``
+and the text carries Cognee's ``# Session learning (session <id>)`` header: a
+memory is filed as a lesson of its session exactly as the server files its own.
 
 Runs at idle and at session end, in place of improve (see
 ``run_session_improve_detailed``). A run is skipped when the transcript has
@@ -620,16 +624,44 @@ def distill(
     return {"memories": kept, "below_threshold": low, "rejected": rejected, "parts": len(parts)}
 
 
-def node_sets(memory: dict, project_tag: str) -> list[str]:
-    """Where a memory is filed. Never empty: there is no uncategorized memory."""
+# Cognee's own lesson node set (cognee.modules.improve.constants). A distilled
+# memory is filed as a lesson the way the server files its own, so recap's
+# "what was learned", recall's session attribution and the graph view's lesson
+# highlight all see it, without the server learning the session a second time.
+LEARNINGS_NODE_SET = "session_learnings"
+
+
+def node_sets(memory: dict, project_tag: str, session_id: str = "") -> list[str]:
+    """Where a memory is filed. Never empty: there is no uncategorized memory.
+
+    With ``session_id`` it is also a lesson of that session:
+    ``session_learnings`` and ``session_learnings:<session id>``.
+    """
     if memory.get("type") == "preference":
-        return ["user_context", "preference"]
-    return [project_tag, str(memory.get("type") or "project_fact")]
+        tags = ["user_context", "preference"]
+    else:
+        tags = [project_tag, str(memory.get("type") or "project_fact")]
+    if session_id:
+        tags += [LEARNINGS_NODE_SET, f"{LEARNINGS_NODE_SET}:{session_id}"]
+    return tags
 
 
-def content(memory: dict) -> str:
+def content(memory: dict, session_id: str = "") -> str:
+    """The text remembered for a memory.
+
+    With ``session_id`` it is rendered the way Cognee renders its own lessons
+    (``cognee.modules.session_distillation.distill.render_lesson_document``), so
+    readers that key on that header treat it as one.
+    """
+    text = memory["text"].strip()
     why = (memory.get("why") or "").strip()
-    return memory["text"].strip() + (f"\nWhy: {why}" if why else "")
+    if not session_id:
+        return text + (f"\nWhy: {why}" if why else "")
+    # Cognee closes the reason with a period; one already there (also 。！？) is kept.
+    if why and not why.endswith((".", "。", "!", "！", "?", "？")):
+        why += "."
+    body = f"{text} ({why})" if why else text
+    return f"# Session learning (session {session_id})\n\n{body}\n"
 
 
 # ---- per-session state ----------------------------------------------------
@@ -686,7 +718,7 @@ def _project_tag(cwd: str) -> str:
     return project_tag(cwd, setting)
 
 
-def _remember(dataset: str, memory: dict, tags: list[str], date: str = "") -> dict:
+def _remember(dataset: str, text: str, tags: list[str], date: str = "") -> dict:
     import _remember_http
     from _plugin_common import dataset_id_for, hook_log, resolved_http_endpoint_auth
 
@@ -696,7 +728,7 @@ def _remember(dataset: str, memory: dict, tags: list[str], date: str = "") -> di
         return _remember_http.do_remember(
             service_url,
             api_key,
-            content(memory),
+            text,
             dataset,
             tags,
             dataset_id=dataset_id_for(dataset),
@@ -802,8 +834,10 @@ def run(dataset: str, session_id: str, *, trigger: str) -> dict:
         failed = 0
         times = turn_times(transcript)
         for memory in result["memories"]:
-            tags = node_sets(memory, tag)
-            outcome = _remember(dataset, memory, tags, effective_date(memory, times))
+            tags = node_sets(memory, tag, session_id)
+            outcome = _remember(
+                dataset, content(memory, session_id), tags, effective_date(memory, times)
+            )
             if not outcome["ok"]:
                 failed += 1
                 hook_log(

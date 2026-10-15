@@ -174,16 +174,17 @@ def test_run_writes_tagged_memories_once(distill, monkeypatch, tmp_path):
     monkeypatch.setattr(
         distill,
         "_remember",
-        lambda ds, m, tags, date: (
-            written.append((ds, distill.content(m), tags, date)) or {"ok": True}
-        ),
+        lambda ds, text, tags, date: written.append((ds, text, tags, date)) or {"ok": True},
     )
     monkeypatch.delenv("COGNEE_PROJECT_NODE_SET", raising=False)
 
     assert distill.run("ds", "sess", trigger="final")["ok"]
     ((dataset, text, tags, date),) = written
-    assert dataset == "ds" and text == "一律用 pnpm 管理套件\nWhy: CI 會壞"
+    assert dataset == "ds"
+    # Filed as a lesson of the session, the way Cognee renders its own.
+    assert text == "# Session learning (session sess)\n\n一律用 pnpm 管理套件 (CI 會壞.)\n"
     assert tags[0].startswith("project-my-app-") and tags[1] == "decision"
+    assert tags[2:] == ["session_learnings", "session_learnings:sess"]
     assert date == "2026-10-14T05:00:00.000Z"  # the time of [U1], the turn its evidence quotes
 
     # Unchanged transcript: nothing is distilled or written again.
@@ -385,7 +386,7 @@ def test_rejected_metadata_still_writes_the_memory(distill, monkeypatch):
         return {"ok": True}
 
     monkeypatch.setattr(_remember_http, "do_remember", fake)
-    assert distill._remember("ds", _memory("一條記憶"), ["p", "decision"], "T1") == {"ok": True}
+    assert distill._remember("ds", "一條記憶", ["p", "decision"], "T1") == {"ok": True}
     assert sent == [[{"effective_date": "T1"}], None]
 
 
@@ -400,5 +401,29 @@ def test_other_write_errors_are_not_retried_without_metadata(distill, monkeypatc
             sent.append(external_metadata) or {"error": "server error", "status": 500}
         ),
     )
-    assert not distill._remember("ds", _memory("一條記憶"), ["p", "decision"], "T1")["ok"]
+    assert not distill._remember("ds", "一條記憶", ["p", "decision"], "T1")["ok"]
     assert len(sent) == 1
+
+
+def test_lesson_tags_and_header_follow_cognee(distill):
+    pref = _memory("回覆一律用繁體中文", type_="preference")
+    assert distill.node_sets(pref, "project-a", "claude_1") == [
+        "user_context",
+        "preference",
+        "session_learnings",
+        "session_learnings:claude_1",
+    ]
+    # The recap keys a lesson row on this tag.
+    assert "session_learnings:claude_1" in distill.node_sets(_memory("x"), "project-a", "claude_1")
+    # Without a session (the dry run) nothing changes.
+    assert distill.node_sets(_memory("x"), "project-a") == ["project-a", "decision"]
+    assert distill.content(_memory("x", why="原因")) == "x\nWhy: 原因"
+    # Same header recall's session attribution matches; a trailing period is not doubled.
+    doc = distill.content(_memory("固定 30 分鐘", why="怕被鎖."), "claude_1")
+    assert doc == "# Session learning (session claude_1)\n\n固定 30 分鐘 (怕被鎖.)\n"
+    assert distill.content(_memory("沒原因"), "claude_1").endswith("\n\n沒原因\n")
+    # A reason already closed in Chinese is not closed twice ("。.").
+    assert distill.content(_memory("x", why="改了沒反應。"), "claude_1").endswith(
+        "x (改了沒反應。)\n"
+    )
+    assert distill.content(_memory("x", why="no reason"), "claude_1").endswith("x (no reason.)\n")
