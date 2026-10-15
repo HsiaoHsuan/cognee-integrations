@@ -991,7 +991,7 @@ Keys are letters, digits, and underscores. Values are taken literally — no `$V
 | improve cooldown | `COGNEE_IMPROVE_COOLDOWN` | `5400` | Minimum seconds between automatic (idle/auto) improves of one session |
 | auto-improve threshold | `COGNEE_AUTO_IMPROVE_EVERY` | `150` | Stored tool calls/stops between automatic improves (`0` disables) |
 | improve submit timeout | `COGNEE_IMPROVE_SUBMIT_TIMEOUT` | `420` | Read timeout for the improve POST |
-| recall mode | `COGNEE_RECALL_MODE` | `skill` | `skill`: nothing is injected per prompt; the model reads memory with the `cognee-search` skill when an answer may depend on an earlier session, so a turn that needs no memory costs no tokens and no wait. `auto`: the `UserPromptSubmit` hook looks memory up and injects it on every prompt (the settings below apply to it). |
+| automatic recall | `COGNEE_AUTO_RECALL` | `false` | `false`: nothing is injected per prompt; the model reads memory with the `cognee-search` skill when an answer may depend on an earlier session, so a turn that needs no memory costs no tokens and no wait. `true`: the `UserPromptSubmit` hook looks memory up and injects it on every prompt (the settings below apply to it). |
 | recall minimum prompt length | `COGNEE_RECALL_MIN_PROMPT_CHARS` | `5` | Prompts shorter than this (surrounding whitespace not counted) skip the per-prompt recall. Values below `5` or non-numeric fall back to `5`. Capture is unaffected. |
 
 ### Per-operation timeouts

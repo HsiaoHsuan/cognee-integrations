@@ -18,7 +18,7 @@ Search when the answer may hinge on what earlier sessions settled and this conve
 
 Do not search for things the conversation or the code already answers. One broad query is usually enough.
 
-If a `UserPromptSubmit` memory block is already in the conversation (`COGNEE_RECALL_MODE=auto`; the default `skill` injects none), search only when it is not enough.
+If a `UserPromptSubmit` memory block is already in the conversation (`COGNEE_AUTO_RECALL=true`; off by default), search only when it is not enough.
 
 ## What is stored
 
@@ -173,6 +173,6 @@ The session cache is never a search source; it reaches the graph through the syn
 | User explicitly says "search cognee" | `cognee-search.sh "<query>"` (server-first) |
 | "what does the codebase do" / "what did we do last time" | `cognee-search.sh "<query>" 10 --graph` |
 | Need a specific category | use the `node_name` curl form above (`["user_context"\|"project_docs"\|"agent_actions"]`) |
-| Auto context insufficient (`COGNEE_RECALL_MODE=auto`) | `cognee-search.sh "<query>" 10` (memory is graph + code only; the session cache is written, never searched) |
+| Auto context insufficient (`COGNEE_AUTO_RECALL=true`) | `cognee-search.sh "<query>" 10` (memory is graph + code only; the session cache is written, never searched) |
 | **Server says empty and the user is recalling something** | **Offer the other readable datasets (`list-datasets.py --others` + AskUserQuestion), then `cognee-search.sh "<query>" 10 --graph --dataset-id <id>`** |
 | **Result empty but you expect content** | **Ground-truth via the credential-resolving `curl` above before concluding "not found"** |

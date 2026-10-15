@@ -13,13 +13,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 ## [1.6.6-fork.6]
 
 ### Changed
-- **Memory is read on demand.** `COGNEE_RECALL_MODE` defaults to `skill`: the
+- **Memory is read on demand.** `COGNEE_AUTO_RECALL` defaults to `false`: the
   `UserPromptSubmit` hook no longer looks memory up and injects it into every
   prompt, which cost tokens and up to `COGNEE_RECALL_BUDGET` seconds of wait on
   turns that needed none. The model reads memory with the `cognee-search` skill,
   whose description now says when to (the answer may depend on an earlier
   session's decision, preference, constraint or fix). The hook still delivers
-  the session's notices. `COGNEE_RECALL_MODE=auto` restores the per-prompt lookup.
+  the session's notices. `COGNEE_AUTO_RECALL=true` restores the per-prompt lookup.
 
 ## [1.6.6-fork.5]
 
