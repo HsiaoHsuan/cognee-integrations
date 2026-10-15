@@ -148,7 +148,7 @@ Shared facts that shape the harness:
 | SessionStart | `session-start.py` |
 | UserPromptSubmit | `session-context-lookup.py`, then `store-user-prompt.py` |
 | PostToolUse | `store-to-session.py` |
-| Stop | `store-to-session.py --stop`, `credits-refresh.py` (+ claude: `clear-transcript-context.py`) |
+| Stop | `store-to-session.py --stop`, `credits-refresh.py` |
 | PreCompact | `pre-compact.py` |
 | SessionEnd | `sync-session-to-graph.py --session-end` |
 

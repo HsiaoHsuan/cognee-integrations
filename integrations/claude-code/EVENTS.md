@@ -14,10 +14,6 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `claude-observer:signal` | `observer.signal` |
 | `claude-observer:started` | `observer.started` |
 | `claude-observer:stopped` | `observer.stopped` |
-| `clear-transcript-context:claude_context_cleared` | `transcript.cleared` |
-| `clear-transcript-context:clear_context_failed` | `transcript.failed` |
-| `clear-transcript-context:clear_context_invalid_payload` | `transcript.invalid_payload` |
-| `clear-transcript-context:clear_context_skipped_stop_hook_active` | `transcript.skip_active` |
 | `config:dataset_name_sanitized` | `config.dataset_name_sanitized` |
 | `config:git_branch_lookup_failed` | `config.git_branch_lookup_failed` |
 | `config:users_me_lookup_failed` | `config.users_me_lookup_failed` |

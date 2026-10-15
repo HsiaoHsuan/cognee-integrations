@@ -221,12 +221,11 @@ _PY39 = _find_python39()
 
 
 @pytest.mark.skipif(not _PY39, reason="no Python 3.9 interpreter on this machine")
-@pytest.mark.parametrize("script", ["credits-refresh.py", "clear-transcript-context.py"])
+@pytest.mark.parametrize("script", ["credits-refresh.py"])
 def test_hook_runs_under_real_python39(suite, run_hook, script):
     """The regression as a user saw it: `python3 <hook>` under 3.9.6 exits 0.
 
-    ``clear-transcript-context.py`` is Claude Code only; the other suites skip it.
-    Both hooks are cheap and network-free, so this stays hermetic.
+    The hook is cheap and network-free, so this stays hermetic.
     """
     if not (suite.scripts_dir / script).exists():
         pytest.skip(f"{suite.name} has no {script}")
