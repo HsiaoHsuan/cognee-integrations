@@ -1,15 +1,34 @@
 ---
 name: cognee-search
-description: Search Cognee memory. Session memory is automatically searched on every prompt via hooks. Use this skill explicitly for permanent knowledge graph search, filtered category search, or when you need more results than the automatic lookup provides.
+description: Search the user's long-term Cognee memory — decisions, standing preferences, product rules, project facts and bug fixes kept from earlier sessions. Use it whenever the answer may depend on something from before this conversation and not visible in it or in the code — "like last time", "what did we decide about X", "why is it done this way", a convention or constraint you are unsure of, or a bug that looks familiar. Search instead of guessing.
 ---
 
 # Cognee Memory Search
 
-Search both session memory and the permanent knowledge graph, optionally filtered by data category.
+Search the permanent knowledge graph, optionally filtered by node set.
 
-## Automatic session search
+## When to search
 
-Session memory is searched **automatically on every user prompt** via the `UserPromptSubmit` hook. You do not need to run this skill to access current-session context.
+Search when the answer may hinge on what earlier sessions settled and this conversation does not show:
+
+- the user points back in time ("like last time", "as we decided", "the usual way")
+- you are about to choose an approach, name, tool or layout the project may already have decided
+- a constraint or convention might exist that the code does not make obvious
+- an error looks like one that was fixed before
+
+Do not search for things the conversation or the code already answers. One broad query is usually enough.
+
+If a `UserPromptSubmit` memory block is already in the conversation (`COGNEE_AUTO_RECALL=true`; off by default), search only when it is not enough.
+
+## What is stored
+
+Each distilled memory is one sentence with its reason, filed as a lesson of the session it came from (`# Session learning (session <id>)`), under node sets you can filter by:
+
+| Node set | Contains |
+|----------|----------|
+| `project-<name>-<hash>` | this project's memories (also `decision`, `spec_rule`, `project_fact`, `feature_req`, `bug_fix`) |
+| `user_context` | the user's standing preferences (also `preference`), and what `cognee-remember` stores for the user |
+| `session_learnings` | every distilled lesson; `session_learnings:<session id>` for one session's |
 
 ## Data categories
 
@@ -39,7 +58,7 @@ Knowledge is organized into three categories via `node_set`:
 
 Use the wrapper below: it queries the server, scoped to the **plugin's dataset** (`$COGNEE_PLUGIN_DATASET`, default `agent_sessions` — the same dataset all plugin writes target, so unrelated datasets don't bleed in), and resolves the endpoint, session and API key the way the hooks do.
 
-**One broad search is usually enough** — the `UserPromptSubmit` hook already injects the graph's memory (and code-graph facts) every turn, so avoid running many targeted searches (each is an extra permission prompt for the user).
+**One broad search is usually enough** — avoid running many targeted searches (each is an extra permission prompt for the user).
 
 ### Search (server-first)
 
@@ -149,10 +168,11 @@ The session cache is never a search source; it reaches the graph through the syn
 
 | Signal | Action |
 |--------|--------|
-| Need current session context | Already automatic, no action needed |
+| Need current session context | It is in the conversation; no search needed |
+| Answer may depend on an earlier session's decision, preference, constraint or fix | `cognee-search.sh "<query>" 10` |
 | User explicitly says "search cognee" | `cognee-search.sh "<query>"` (server-first) |
 | "what does the codebase do" / "what did we do last time" | `cognee-search.sh "<query>" 10 --graph` |
 | Need a specific category | use the `node_name` curl form above (`["user_context"\|"project_docs"\|"agent_actions"]`) |
-| Auto context insufficient | `cognee-search.sh "<query>" 10` (memory is graph + code only; the session cache is written, never searched) |
+| Auto context insufficient (`COGNEE_AUTO_RECALL=true`) | `cognee-search.sh "<query>" 10` (memory is graph + code only; the session cache is written, never searched) |
 | **Server says empty and the user is recalling something** | **Offer the other readable datasets (`list-datasets.py --others` + AskUserQuestion), then `cognee-search.sh "<query>" 10 --graph --dataset-id <id>`** |
 | **Result empty but you expect content** | **Ground-truth via the credential-resolving `curl` above before concluding "not found"** |

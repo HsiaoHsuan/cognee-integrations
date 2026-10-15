@@ -31,7 +31,7 @@ Run **one** broad search via the wrapper and answer from it. It queries the **ru
 "${CLAUDE_PLUGIN_ROOT}/scripts/cognee-search.sh" "<query>" 10
 ```
 
-**Do not fan out into many targeted calls.** One broad search plus the context the `UserPromptSubmit` hook already injects on every turn is enough — multiple calls just add latency and (un-allowlisted) permission prompts for the user. Memory is read from the knowledge graph (and the code graph via `--code`) only; there is no session-cache search.
+**Do not fan out into many targeted calls.** One broad search is enough (with `COGNEE_AUTO_RECALL=true`, plus the context the `UserPromptSubmit` hook injects on every turn) — multiple calls just add latency and (un-allowlisted) permission prompts for the user. Memory is read from the knowledge graph (and the code graph via `--code`) only; there is no session-cache search.
 
 **Manual ground-truth only (not part of the normal flow):** if a result is empty and you genuinely doubt it, you may confirm directly. Category filtering uses `node_name` (the CLI doesn't expose it):
 ```bash

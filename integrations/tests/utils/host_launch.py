@@ -47,12 +47,14 @@ _INSTALL_DIRS = {
 #: The knobs from isolation.DETERMINISTIC_ENV that keep background processes
 #: out of a test, and nothing else: no PYTHONIOENCODING (users don't set it, and
 #: it hid the Windows encoding bugs) and no COGNEE_PLUGIN_IN_VENV (a fresh HOME
-#: has no venv, and cloud mode never builds one).
+#: has no venv, and cloud mode never builds one). COGNEE_AUTO_RECALL=true keeps
+#: the per-prompt recall these sessions assert on (the plugin default is off).
 QUIET_ENV = {
     "COGNEE_IDLE_DISABLED": "1",
     "COGNEE_UPDATE_CHECK": "off",
     "COGNEE_LAZY_BOOTSTRAP": "0",
     "COGNEE_LLM_OBSERVER": "false",
+    "COGNEE_AUTO_RECALL": "true",
 }
 
 

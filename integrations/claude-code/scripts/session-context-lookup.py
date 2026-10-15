@@ -882,6 +882,16 @@ def _recall_min_prompt_chars() -> int:
         return 5
 
 
+def _auto_recall() -> bool:
+    """``COGNEE_AUTO_RECALL``: look memory up and inject it on every prompt (default off).
+
+    Off, nothing is injected per prompt: the model reads memory with the
+    cognee-search skill when it needs it, so a turn that needs none costs no
+    tokens and no wait. On is the per-prompt lookup this hook always ran.
+    """
+    return os.environ.get("COGNEE_AUTO_RECALL", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def main():
     if is_observer_child():
         return
@@ -902,6 +912,15 @@ def main():
     )
     if not get_session_key():
         hook_log("context_lookup_missing_session_key")
+        return
+
+    if not _auto_recall():
+        hook_log("context_lookup_skipped_auto_recall_off")
+        # Only the session's rare notices (endpoint changed, capture policy)
+        # survive; no memory is injected.
+        output = with_base_url_notice(None, "UserPromptSubmit")
+        if output:
+            print(json.dumps(output))
         return
 
     prompt = payload.get("prompt", "")
