@@ -422,3 +422,8 @@ def test_lesson_tags_and_header_follow_cognee(distill):
     doc = distill.content(_memory("固定 30 分鐘", why="怕被鎖."), "claude_1")
     assert doc == "# Session learning (session claude_1)\n\n固定 30 分鐘 (怕被鎖.)\n"
     assert distill.content(_memory("沒原因"), "claude_1").endswith("\n\n沒原因\n")
+    # A reason already closed in Chinese is not closed twice ("。.").
+    assert distill.content(_memory("x", why="改了沒反應。"), "claude_1").endswith(
+        "x (改了沒反應。)\n"
+    )
+    assert distill.content(_memory("x", why="no reason"), "claude_1").endswith("x (no reason.)\n")

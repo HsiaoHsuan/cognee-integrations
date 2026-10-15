@@ -657,7 +657,10 @@ def content(memory: dict, session_id: str = "") -> str:
     why = (memory.get("why") or "").strip()
     if not session_id:
         return text + (f"\nWhy: {why}" if why else "")
-    body = f"{text} ({why.rstrip('.')}.)" if why else text
+    # Cognee closes the reason with a period; one already there (also 。！？) is kept.
+    if why and not why.endswith((".", "。", "!", "！", "?", "？")):
+        why += "."
+    body = f"{text} ({why})" if why else text
     return f"# Session learning (session {session_id})\n\n{body}\n"
 
 
