@@ -131,3 +131,25 @@ def test_a_silent_server_costs_one_deadline_and_the_hook_still_exits_clean(
     )
     # And the process did not linger on its worker threads after the deadline.
     assert wall < DEADLINE_S + 20.0, f"hook took {wall:.1f}s against a {DEADLINE_S}s deadline"
+
+
+def test_skill_mode_sends_no_lookup_and_injects_nothing(
+    suite, run_hook, black_hole, payloads, temp_home, assert_clean_real_home
+):
+    """``COGNEE_RECALL_MODE=skill``: memory is read by the cognee-search skill on
+    demand, so the per-prompt hook neither queries the server nor adds context."""
+    if suite.name != "claude-code":
+        pytest.skip("on-demand recall ships with the Claude Code plugin only")
+    result = run_hook(
+        suite,
+        "session-context-lookup.py",
+        stdin=payloads.user_prompt(prompt="what did we decide about the retry policy?"),
+        service_url=black_hole.url,
+        env={"COGNEE_RECALL_MODE": "skill", "COGNEE_RECALL_BUDGET": str(DEADLINE_S)},
+        timeout=60.0,
+    )
+    assert result.returncode == 0, result.stderr
+    assert black_hole.accepted == 0, "skill mode must not contact the server"
+    assert "Relevant" not in result.stdout and "memory" not in result.stdout.lower()
+    events = [e for e, _ in hook_events(suite, temp_home)]
+    assert "context_lookup_skipped_skill_mode" in events, events

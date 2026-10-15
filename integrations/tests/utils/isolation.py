@@ -74,8 +74,12 @@ ISOLATED_MODULES = (
 #:     the observer tests opt back in.
 #:   - COGNEE_DISTILL=false keeps the improve path the hook tests assert on;
 #:     session distill would call `claude -p` instead. test_distill opts back in.
+#:   - COGNEE_RECALL_MODE=auto keeps the per-prompt recall the hook tests assert
+#:     on; the plugin default is skill (on demand), which test_recall_deadline
+#:     covers.
 DETERMINISTIC_ENV = {
     "COGNEE_DISTILL": "false",
+    "COGNEE_RECALL_MODE": "auto",
     "COGNEE_PLUGIN_IN_VENV": "1",
     "COGNEE_IDLE_DISABLED": "1",
     "COGNEE_UPDATE_CHECK": "off",
