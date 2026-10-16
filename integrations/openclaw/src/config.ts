@@ -1,5 +1,7 @@
 import type { CogneeMode, CogneePluginConfig, CogneeSearchType, MemoryScope, ScopeRoute } from "./types.js";
 import { sanitizeDatasetName } from "./scope.js";
+import { contextCharsLimit, passageCharsLimit } from "./recall-text.js";
+import { capturePolicyFromEnv } from "./capture-policy.js";
 
 // ---------------------------------------------------------------------------
 // Defaults
@@ -21,16 +23,17 @@ export const DEFAULT_IMPROVE_ON_SESSION_END = true;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 120_000;
 export const DEFAULT_INGESTION_TIMEOUT_MS = 300_000;
 
-// Recall hot path — same defaults as the claude-code/codex integrations
-// (COGNEE_RECALL_TIMEOUT=10s, COGNEE_RECALL_BUDGET=12s,
-//  COGNEE_BREAKER_THRESHOLD=5, COGNEE_BREAKER_COOLDOWN=120s).
+// Recall hot path — same budget as the claude-code/codex integrations
+// (COGNEE_RECALL_BUDGET=20s, COGNEE_BREAKER_THRESHOLD=5,
+//  COGNEE_BREAKER_COOLDOWN=120s). Those plugins run every recall request
+// against that one deadline, so the per-call timeout matches the budget here.
 // Sized for the graph scope, which runs last and is the only expensive call:
 // graph search time grows with the dataset and with the round trip to a
 // remote (cloud) server, and a call that overruns its timeout contributes
 // nothing, so a cap tuned for a small local graph silently drops graph memory
 // once either grows.
-export const DEFAULT_RECALL_TIMEOUT_MS = 10_000;
-export const DEFAULT_RECALL_BUDGET_MS = 12_000;
+export const DEFAULT_RECALL_TIMEOUT_MS = 20_000;
+export const DEFAULT_RECALL_BUDGET_MS = 20_000;
 export const DEFAULT_RECALL_BREAKER_THRESHOLD = 5;
 export const DEFAULT_RECALL_BREAKER_COOLDOWN_MS = 120_000;
 
@@ -42,6 +45,7 @@ export const DEFAULT_MEMORY_FORGET_TOOL = true;
 export const DEFAULT_DATASET_SWITCH_TOOL = true;
 export const DEFAULT_RECALL_SESSION_LAYERS = true;
 export const DEFAULT_CODE_SEARCH_TOOL = true;
+export const DEFAULT_RECAP_TOOL = true;
 export const DEFAULT_CODE_GRAPH_RECALL = true;
 export const DEFAULT_MEMORY_STEER = true;
 export const DEFAULT_MEMORY_STEER_TEXT =
@@ -115,6 +119,12 @@ export function resolveConfig(rawConfig: unknown): Required<CogneePluginConfig> 
   const maxResults = typeof raw.maxResults === "number" ? raw.maxResults : DEFAULT_MAX_RESULTS;
   const minScore = typeof raw.minScore === "number" ? raw.minScore : DEFAULT_MIN_SCORE;
   const maxTokens = typeof raw.maxTokens === "number" ? raw.maxTokens : DEFAULT_MAX_TOKENS;
+  // Recall trimming caps (claude/codex COGNEE_RECALL_PASSAGE_CHARS / _CONTEXT_CHARS):
+  // config wins, then the env knob, then the default; 0 disables a cap.
+  const capOrDefault = (value: unknown, fallback: () => number) =>
+    Number.isInteger(value) && (value as number) >= 0 ? (value as number) : fallback();
+  const recallPassageChars = capOrDefault(raw.recallPassageChars, passageCharsLimit);
+  const recallContextChars = capOrDefault(raw.recallContextChars, contextCharsLimit);
   const autoRecall = typeof raw.autoRecall === "boolean" ? raw.autoRecall : DEFAULT_AUTO_RECALL;
   const autoIndex = typeof raw.autoIndex === "boolean" ? raw.autoIndex : DEFAULT_AUTO_INDEX;
   const autoCognify = typeof raw.autoCognify === "boolean" ? raw.autoCognify : DEFAULT_AUTO_COGNIFY;
@@ -170,6 +180,7 @@ export function resolveConfig(rawConfig: unknown): Required<CogneePluginConfig> 
 
   // Code graph
   const codeSearchTool = typeof raw.codeSearchTool === "boolean" ? raw.codeSearchTool : DEFAULT_CODE_SEARCH_TOOL;
+  const recapTool = typeof raw.recapTool === "boolean" ? raw.recapTool : DEFAULT_RECAP_TOOL;
   const codeGraphRecall = typeof raw.codeGraphRecall === "boolean" ? raw.codeGraphRecall : DEFAULT_CODE_GRAPH_RECALL;
   const codeDatasets = Array.isArray(raw.codeDatasets) ? raw.codeDatasets.filter((d): d is string => typeof d === "string" && d.trim().length > 0).map((d) => d.trim()) : [];
 
@@ -196,15 +207,26 @@ export function resolveConfig(rawConfig: unknown): Required<CogneePluginConfig> 
   const enableSessions = typeof raw.enableSessions === "boolean" ? raw.enableSessions : true;
   const persistSessionsAfterEnd = typeof raw.persistSessionsAfterEnd === "boolean" ? raw.persistSessionsAfterEnd : true;
   const captureSession = typeof raw.captureSession === "boolean" ? raw.captureSession : true;
+  // Capture policy lists: an empty list means "not set", and the plugin then
+  // falls back to the COGNEE_CAPTURE_* env var the claude-code/codex plugins
+  // read (see capturePolicyOptions in plugin.ts). captureRedact resolves here.
+  const stringList = (value: unknown) =>
+    Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : [];
+  const captureTools = stringList(raw.captureTools);
+  const captureDenyTools = stringList(raw.captureDenyTools);
+  const captureDenyPaths = stringList(raw.captureDenyPaths);
+  const captureRedactPatterns = stringList(raw.captureRedactPatterns);
+  const captureRedact = typeof raw.captureRedact === "boolean" ? raw.captureRedact : capturePolicyFromEnv().redact !== false;
 
   return {
     mode, baseUrl, apiKey, username, password, datasetName,
     companyDataset, userDatasetPrefix, agentDatasetPrefix, agentDatasetTemplate, userId, agentId,
     recallScopes, defaultWriteScope, scopeRouting, perAgentMemory,
-    recallInjectionPosition, memoryHitFooter, memoryHitFooterFormat, weeklyDigest, memoryTools, memoryForgetTool, datasetSwitchTool, codeSearchTool, codeGraphRecall, codeDatasets, memorySteer, memorySteerText, recallSessionLayers, noiseTriggers, noisePatterns,
+    recallInjectionPosition, memoryHitFooter, memoryHitFooterFormat, weeklyDigest, memoryTools, memoryForgetTool, datasetSwitchTool, codeSearchTool, recapTool, codeGraphRecall, codeDatasets, memorySteer, memorySteerText, recallSessionLayers, noiseTriggers, noisePatterns,
     enableSessions, persistSessionsAfterEnd, captureSession,
+    captureTools, captureDenyTools, captureDenyPaths, captureRedact, captureRedactPatterns,
     searchType, searchPrompt, deleteMode,
-    maxResults, minScore, maxTokens,
+    maxResults, minScore, maxTokens, recallPassageChars, recallContextChars,
     autoRecall, autoIndex, autoCognify, autoMemify, improveOnSessionEnd,
     requestTimeoutMs, ingestionTimeoutMs, chunkSize,
     recallTimeoutMs, recallBudgetMs, recallBreakerThreshold, recallBreakerCooldownMs,

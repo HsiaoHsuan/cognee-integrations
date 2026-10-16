@@ -29,6 +29,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -112,7 +113,9 @@ def _list(host_key: str, rec: dict) -> dict:
     try:
         listing = list_writable_datasets(user_id)
     except urllib.error.HTTPError as exc:
-        raise SwitchError(EXIT_ERROR, f"GET /api/v1/datasets failed (HTTP {exc.code})")
+        # Name the request that failed: the listing makes more than one.
+        path = urllib.parse.urlsplit(str(getattr(exc, "url", "") or "")).path or "/api/v1/datasets"
+        raise SwitchError(EXIT_ERROR, f"GET {path} failed (HTTP {exc.code})")
     except Exception as exc:
         raise SwitchError(EXIT_ERROR, f"GET /api/v1/datasets failed ({exc})")
     current = str(rec.get("dataset") or resolved.get("dataset") or "")
@@ -309,6 +312,11 @@ def _switch(host_key: str, rec: dict, target: str, *, force: bool) -> dict:
     # guaranteed writable; anything else is refused up front rather than failing
     # half-way through.
     listing = list_writable_datasets(user_id)
+    # The lister resolves the principal itself when the launch record carries
+    # none (a cloud tenant the session was not registered on): without it every
+    # dataset, the user's own included, would count as someone else's and be
+    # switched to by UUID.
+    user_id = user_id or str(listing.get("user_id") or "")
     from _dataset_access import dataset_id
 
     matches = [row for row in listing["datasets"] if target in (row["id"], row["name"])]

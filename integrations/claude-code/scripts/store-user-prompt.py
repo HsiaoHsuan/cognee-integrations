@@ -20,6 +20,7 @@ from pathlib import Path
 
 # Add scripts dir to path for helper imports
 sys.path.insert(0, os.path.dirname(__file__))
+from _cloud_worker import enabled as cloud_enabled
 from _logfiles import rotate_if_oversized as _rotate_log_if_oversized
 from _plugin_common import (
     bump_save_counter,
@@ -49,7 +50,7 @@ _WATCHER_SCRIPT = Path(__file__).with_name("idle-watcher.py")
 
 
 def _load_session() -> tuple[str, str, str, str]:
-    resolved = load_resolved()
+    resolved = load_resolved(identity=False) if cloud_enabled() else load_resolved()
     session_id = resolved.get("session_id", "")
     dataset = resolved.get("dataset", "")
     user_id = resolved.get("user_id", "")
@@ -73,7 +74,16 @@ def _watcher_alive() -> bool:
 
 
 def _ensure_idle_watcher(session_id: str, dataset: str, user_id: str, config: dict) -> None:
-    """Start the idle watcher on a new prompt if the prior one exited after bridging."""
+    """Start the idle watcher on a new prompt if none is running.
+
+    In cloud mode the per-user cloud worker replaces it; the prompt only marks
+    the session active for that worker.
+    """
+    if cloud_enabled():
+        from _cloud_worker import touch_session
+
+        touch_session()
+        return
     if os.environ.get("COGNEE_IDLE_DISABLED", "").lower() in ("1", "true", "yes"):
         return
     if not session_id or _watcher_alive():
@@ -186,6 +196,9 @@ async def _store(prompt: str, payload: dict):
     )
     hook_log("prompt_pending", {"chars": len(prompt), "turn_id": payload.get("turn_id")})
     notify(f"user prompt pending ({len(prompt)} chars)")
+    if cloud_enabled(runtime):
+        # A pending prompt is durable locally, but is not a server save yet.
+        return
     bump_save_counter(session_id, "prompt")
 
     # Replay any warmup-buffered entries. This hook is the async sibling of

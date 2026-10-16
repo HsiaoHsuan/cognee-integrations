@@ -1,6 +1,15 @@
 ---
 name: cognee-timeline
-description: A dated chronology of one topic across the user's recorded coding-agent sessions — the lessons the graph learned about it and the prompts that named it, oldest first. Use only when the user explicitly asks for the history or timeline of a topic across their sessions ("how did X evolve", "when did we first discuss X") or invokes /cognee-timeline. Not for questions about code or the current task.
+description: >-
+  A dated chronology of one topic across the user's recorded coding-agent sessions,
+  oldest first: the lessons the graph learned about it and the prompts that named it.
+  Default last 30 days; also all time or a date.
+when_to_use: >-
+  E.g. "how did X evolve?", "when did we first discuss X?", "timeline of X", "history of
+  X across my sessions", "how has our thinking on X changed?", "when did we decide on
+  X?". Not for a current fact (cognee-search), a day or week recap (cognee-standup,
+  cognee-digest), Cognee's performance over time (cognee-report), git history or blame,
+  or a timeline or Gantt chart.
 ---
 
 # Cognee Timeline

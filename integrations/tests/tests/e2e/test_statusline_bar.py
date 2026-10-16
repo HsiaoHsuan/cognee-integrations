@@ -43,6 +43,7 @@ def _render(suite, run_hook, base_url, stdin="{}"):
         stdin=stdin,
         service_url=base_url,
         api_key=None,
+        env={"COGNEE_STATUSLINE_STYLE": "classic"},
     )
 
 

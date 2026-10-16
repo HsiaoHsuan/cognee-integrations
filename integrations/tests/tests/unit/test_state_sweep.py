@@ -49,8 +49,12 @@ def _dead_pid() -> int:
 # ── status markers and per-session caches: age only ────────────────────────
 
 
-@pytest.mark.parametrize("subdir", ["conn-state", "llm-state", "recall", "bridge", "pending"])
+@pytest.mark.parametrize(
+    "subdir", ["conn-state", "llm-state", "recall", "bridge", "pending", "phase", "band"]
+)
 def test_week_old_session_files_go_and_recent_ones_stay(pc, subdir):
+    if subdir in ("phase", "band") and not hasattr(pc, "_PHASE_DIR"):
+        pytest.skip("no live-activity marker on this suite")
     directory = pc._PLUGIN_DIR / subdir
     old = _write(directory / "old.json", {"x": 1}, 8 * DAY)
     fresh = _write(directory / "fresh.json", {"x": 1}, 6 * DAY)
@@ -61,6 +65,18 @@ def test_week_old_session_files_go_and_recent_ones_stay(pc, subdir):
 
 def test_nothing_to_do_is_silent(pc):
     assert pc.sweep_stale_state() == {}
+
+
+def test_cloud_quarantine_expires_but_pending_work_is_untouched(pc, suite):
+    if suite.name != "claude-code":
+        pytest.skip("Claude cloud worker")
+    for directory in ("spool", "improve-wanted"):
+        expired = pc._PLUGIN_DIR / directory / "expired"
+        old = _write(expired / "old.json", {"entry": "private"}, 8 * DAY)
+        recent = _write(expired / "recent.json", {"entry": "private"}, 6 * DAY)
+        pending = _write(pc._PLUGIN_DIR / directory / "pending.json", {"entry": "retry"}, 8 * DAY)
+        pc.sweep_stale_state()
+        assert not old.exists() and recent.exists() and pending.exists()
 
 
 # ── launch records: pid death + grace, or 30 days ─────────────────────────
@@ -225,3 +241,37 @@ def test_sweep_never_touches_other_plugins_state(pc, suite, temp_home):
 def test_session_start_runs_the_sweep(suite):
     source = (suite.scripts_dir / "session-start.py").read_text(encoding="utf-8")
     assert "sweep_stale_state()" in source
+
+
+def test_an_unremovable_session_dir_does_not_stop_log_rotation(pc, monkeypatch, suite):
+    if suite.name != "claude-code":
+        pytest.skip("Claude cloud session directories")
+    import shutil
+
+    monkeypatch.setenv("COGNEE_PLUGIN_LOG_MAX_BYTES", "100")
+    _write(pc._PLUGIN_DIR / "sessions" / "old-host" / "stats.json", {}, 30 * DAY)
+    big = pc._PLUGIN_DIR / "cloud-worker.log"
+    big.write_bytes(b"x" * 500)
+
+    def denied(path, *a, **kw):
+        raise PermissionError("not allowed")
+
+    monkeypatch.setattr(shutil, "rmtree", denied)
+    counts = pc.sweep_stale_state()
+    assert any("sessions/old-host" in error for error in counts["errors"])
+    assert counts["logs_rotated"] == 1 and not big.exists()
+
+
+def test_idle_session_folders_are_swept(pc, suite):
+    """Per-session folders (memory tags, credit state, the final-sync stored count;
+    on Claude Code also the injection ledger) go after a week idle (SDK-1071)."""
+    if suite.name == "antigravity":
+        pytest.skip("no per-session folders")
+    sessions = pc._PLUGIN_DIR / "sessions"
+    _write(sessions / "idle-host" / "tags.json", {}, 8 * DAY)
+    _write(sessions / "busy-host" / "tags.json", {}, 8 * DAY)
+    _write(sessions / "busy-host" / "credit.json", {}, 60)
+    counts = pc.sweep_stale_state()
+    assert not (sessions / "idle-host").exists()
+    assert (sessions / "busy-host" / "tags.json").is_file()  # one fresh file keeps it
+    assert counts.get("sessions") == 1

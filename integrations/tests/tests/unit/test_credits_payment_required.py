@@ -260,6 +260,10 @@ def test_other_recall_failures_touch_no_note(lookup, monkeypatch, code):
 @pytest.fixture
 def store(suite, hook_module, monkeypatch):
     module = hook_module(suite, "store-to-session.py")
+    if suite.name == "claude-code":
+        # Inline writes remain the local path; cloud spool outcomes have separate tests.
+        monkeypatch.setattr(module, "cloud_enabled", lambda *args: False)
+
     calls: list[tuple] = []
     monkeypatch.setattr(module, "hook_log", lambda *a, **k: None)
     monkeypatch.setattr(module, "notify", lambda *a, **k: None)

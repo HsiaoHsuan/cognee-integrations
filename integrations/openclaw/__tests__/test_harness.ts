@@ -133,6 +133,7 @@ describe("createPluginApi", () => {
       "resolveOrMintApiKey",
       "spawnExitWatcher",
       "waitForServerHealth",
+      "writeExitWatcherBridge",
     ]);
   });
 });

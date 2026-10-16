@@ -19,6 +19,8 @@ from werkzeug import Request, Response
 
 from .identity_fake import IdentityFake
 
+_ENTRY_SCHEMA_REF = "#/components/schemas/RememberEntryPayload"
+
 #: Terminal cognify status the clients poll for on /api/v1/datasets/status.
 STATUS_COMPLETED = "DATASET_PROCESSING_COMPLETED"
 STATUS_ERRORED = "DATASET_PROCESSING_ERRORED"
@@ -260,14 +262,36 @@ class MockCogneeServer:
                         ),
                         **(
                             {
+                                # As a real server describes it: the entry's
+                                # request body, behind a $ref, lists dataset_id.
                                 "/api/v1/remember/entry": {
-                                    "post": {"x-cognee-session-dataset-ids": True}
+                                    "post": {
+                                        "requestBody": {
+                                            "content": {
+                                                "application/json": {
+                                                    "schema": {"$ref": _ENTRY_SCHEMA_REF}
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             if self.identity.typed_dataset_ids
                             else {}
                         ),
-                    }
+                    },
+                    "components": {
+                        "schemas": {
+                            "RememberEntryPayload": {
+                                "properties": {
+                                    "dataset_id": {},
+                                    "dataset_name": {},
+                                    "entry": {},
+                                    "session_id": {},
+                                }
+                            }
+                        }
+                    },
                 },
             ),
         )

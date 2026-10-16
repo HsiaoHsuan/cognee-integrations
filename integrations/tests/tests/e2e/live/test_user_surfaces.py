@@ -94,34 +94,31 @@ def test_the_status_line_renders_against_a_real_server(recalled_session, live_su
     assert "cognee:" in bar.stdout, f"unrecognisable status line: {bar.stdout!r}"
 
 
-def test_the_status_line_shows_the_counts_from_a_real_recall(recalled_session, live_suite):
-    """A recall that found something must be visible in the counts segment.
+def test_the_status_line_shows_what_a_real_recall_did(recalled_session, live_suite):
+    """A recall that found something must be visible in the activity segment.
 
-    The counts are the user's only quantitative signal that memory is working; a
-    silent regression here looks exactly like a quiet session.
+    The segment is the user's only signal that memory is working; a silent
+    regression here looks exactly like a quiet session.
 
     Claude Code only: Codex and Antigravity use short plain-text bars with no
-    diagnostics strip.
+    activity segment.
     """
     if not live_suite.has_rich_statusline:
-        pytest.skip(f"{live_suite.name}: the bar is plain text and has no counts segment")
+        pytest.skip(f"{live_suite.name}: the bar is plain text and has no activity segment")
 
     session, recalled = recalled_session
     bar = session.run("cognee_statusline_render.py", {"session_id": session.session_id})
     assert bar.ok, f"status line render failed (rc={bar.returncode}): {bar.stderr[:500]}"
 
-    assert "memory hit" in bar.stdout, (
-        f"the bar omitted the memory-hit counts after a successful recall: {bar.stdout!r}"
+    assert "used" in bar.stdout, (
+        f"the bar omitted what the recall did after a successful recall: {bar.stdout!r}"
     )
-    # The rendered count must not be zero — that would misreport a real hit —
-    # and the session total must have registered the hit rather than still
-    # calling the memory "warming up".
-    assert "0 memory hits" not in bar.stdout, (
-        f"the bar reported zero hits despite {recalled} hits: {bar.stdout!r}"
+    # The rendered result must carry the count — "nothing relevant" would
+    # misreport a real hit.
+    assert "nothing relevant" not in bar.stdout, (
+        f"the bar reported nothing recalled despite {recalled} hits: {bar.stdout!r}"
     )
-    assert "turns had hits this session" in bar.stdout, (
-        f"the bar has no session total after a recall with hits: {bar.stdout!r}"
-    )
+    assert "memor" in bar.stdout, f"the bar has no memory count after a recall: {bar.stdout!r}"
 
 
 def test_precompact_produces_an_anchor_carrying_the_session(

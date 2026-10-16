@@ -1,11 +1,36 @@
 ---
 name: cognee-search
-description: Search the user's long-term Cognee memory — decisions, standing preferences, product rules, project facts and bug fixes kept from earlier sessions. Use it whenever the answer may depend on something from before this conversation and not visible in it or in the code — "like last time", "what did we decide about X", "why is it done this way", a convention or constraint you are unsure of, or a bug that looks familiar. Search instead of guessing.
+description: >-
+  Search the user's long-term Cognee memory — decisions, standing preferences, product
+  rules, project facts and bug fixes kept from earlier sessions. Search instead of guessing.
+when_to_use: >-
+  When the answer may hinge on an earlier session: "like last time", "what did we decide
+  about X", "why is it done this way", an unsure convention, a familiar bug. Also "search Cognee for X", "check <dataset>
+  for X" (once, without switching). Not for making another dataset active
+  (cognee-switch-datasets), a topic's history (cognee-timeline), exact code lookups
+  (cognee-code), or file, code or web search.
 ---
 
 # Cognee Memory Search
 
 Search the permanent knowledge graph, optionally filtered by node set.
+
+## The `search` tool, when it is listed
+
+Where Claude Code loads the plugin's hooks module, `mcp__cognee-memory__search`
+(`query`, `top_k`, `scope` graph|code, `dataset_id`) runs the same wrapper as
+this skill with typed arguments and no Bash call. Prefer it when it is among your
+tools (load its schema through tool search); this skill is the path everywhere
+else, and its notes below on reading results and on other datasets apply to both.
+
+## Visible search progress
+
+Before running a Cognee search, send one short user-visible progress sentence,
+for example: "Searching Cognee for the earlier decision…" or "Checking Cognee's
+code graph for callers of this function…". Name Cognee in the normal working
+text before the tool call; keep this to one update per related search batch.
+Afterwards, describe relevant findings, an empty result, or a failed search
+accurately. Do not claim Cognee improved the answer merely because a search ran.
 
 ## When to search
 
@@ -176,3 +201,37 @@ The session cache is never a search source; it reaches the graph through the syn
 | Auto context insufficient (`COGNEE_AUTO_RECALL=true`) | `cognee-search.sh "<query>" 10` (memory is graph + code only; the session cache is written, never searched) |
 | **Server says empty and the user is recalling something** | **Offer the other readable datasets (`list-datasets.py --others` + AskUserQuestion), then `cognee-search.sh "<query>" 10 --graph --dataset-id <id>`** |
 | **Result empty but you expect content** | **Ground-truth via the credential-resolving `curl` above before concluding "not found"** |
+
+### Inspectable evidence
+
+For source inspection, use the compact index and expand only the useful references:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/cognee-evidence.py" index "retry policy"
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/cognee-evidence.py" details 'cognee://datasets/...'
+# Or pass 1–5 reference objects copied from index.items[].reference in one request:
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/cognee-evidence.py" details --references '[{...}]'
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/cognee-evidence.py" explain
+```
+
+The index returns at most 20 records without source bodies. Each available item has
+its dataset, artifact identity, content version, source locator and a resolvable
+`cognee://` citation. `details` accepts up to five citations or reference objects.
+Use `--dataset-id UUID` on `index` for another readable dataset; this does not switch
+sessions. `explain --session-key HOST_SESSION_ID` selects a specific session receipt.
+
+Cite the exact reference attached to a passage you actually use. A reference means
+retrieval used that artifact, not that it proves every claim in an answer. Graph
+entities/relationships are explicitly marked derived; prefer source passages for
+original evidence. Raw source downloads are current documents, not historical copies.
+On `changed`, the old version no longer matches: inspect the returned current
+reference before citing it. `unavailable` covers deleted or unauthorized artifacts;
+`error` means the store failed, not that evidence is absent. Never silently replace
+an old citation. Bounded excerpts report `truncated`.
+
+Automatic recall attaches versioned evidence in its existing graph request and
+keeps the 45-second cloud limit. Its body-free last-turn receipt explains each
+candidate: injected, already in context, over budget, or unavailable. Selection
+uses retrieval rank and source priority; it is not a causal attribution of answer
+quality. Legacy servers keep normal recall and report the evidence index as
+unsupported; unversioned context is marked unaddressable in the receipt.

@@ -146,7 +146,7 @@ _HOST_PYTHON_CANDIDATES = (
 # refusal reaches the user as a systemMessage (the worker that hits it runs
 # detached, with nothing it prints visible). Cleared once a venv is ready.
 _HOST_PYTHON_MARKER = _GLOBAL_STATE_DIR / "host-python-unsupported.json"
-_PINNED_COGNEE_VERSION = "1.6.1"
+_PINNED_COGNEE_VERSION = "1.6.3"
 _INSTALL_TIMEOUT_SECONDS = float(os.environ.get("COGNEE_INSTALL_TIMEOUT", "") or 600.0)
 
 # Maps a configured backend provider env var to the cognee package "extra" that
@@ -351,7 +351,7 @@ def _venv_cognee_version() -> str:
 
 
 # One distribution per extra whose presence in the venv proves that extra's
-# drivers are installed (verified against cognee 1.6.1's optional-dependencies:
+# drivers are installed (verified against cognee 1.6.3's optional-dependencies:
 # fastembed and codegraph are empty extras there, their packages being core).
 # Probing the venv is deliberately preferred over recording installed extras in
 # venv-ready.json: that marker is shared with plugins that don't know about
@@ -2017,9 +2017,8 @@ async def _start(payload: dict | None = None) -> dict:
     # an immediate improve on startup.
     touch_activity()
 
-    # Launch the idle watcher (syncs session memory to graph after the agent
-    # goes idle). Runs in both local-server and cloud modes — the watcher picks
-    # the HTTP or local sync path itself. COGNEE_IDLE_DISABLED opts out.
+    # Launch the idle watcher (update and LLM-key checks, periodic shared-memory
+    # refresh). COGNEE_IDLE_DISABLED opts out.
     if os.environ.get("COGNEE_IDLE_DISABLED", "").lower() not in (
         "1",
         "true",

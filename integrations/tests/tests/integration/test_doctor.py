@@ -67,6 +67,7 @@ def test_json_report_has_exactly_the_expected_keys(doctor, mock_server, suite):
     parsed = json.loads(doctor.format_json(report))
     expected = set(_REPORT_KEYS)
     if suite.name == "claude-code":
+        expected.add("auto_memory")
         expected.add("llm")  # where the local server's LLM calls go (key vs. Claude observer)
     assert set(parsed.keys()) == expected, f"keys mismatch: {expected ^ set(parsed.keys())}"
 

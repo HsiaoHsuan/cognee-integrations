@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -47,6 +48,7 @@ from _plugin_common import (
     PRESENCE_ABSENT,
     PRESENCE_READY,
     _https_context,
+    _is_loopback_host,
     _reexec_into_venv,
     apply_cognee_env,
     clear_server_pidfile,
@@ -55,6 +57,8 @@ from _plugin_common import (
     hook_log,
     is_observer_child,
     managed_endpoint_enabled,
+    phase_begin,
+    phase_end,
     probe_health,
     quiet_hook_output,
     resolve_session_key_from_payload,
@@ -151,7 +155,7 @@ _HOST_PYTHON_CANDIDATES = (
 # refusal reaches the user as a systemMessage (the worker that hits it runs
 # detached, with nothing it prints visible). Cleared once a venv is ready.
 _HOST_PYTHON_MARKER = _GLOBAL_STATE_DIR / "host-python-unsupported.json"
-_PINNED_COGNEE_VERSION = "1.6.1"
+_PINNED_COGNEE_VERSION = "1.6.3"
 _INSTALL_TIMEOUT_SECONDS = float(os.environ.get("COGNEE_INSTALL_TIMEOUT", "") or 600.0)
 
 # Maps a configured backend provider env var to the cognee package "extra" that
@@ -356,7 +360,7 @@ def _venv_cognee_version() -> str:
 
 
 # One distribution per extra whose presence in the venv proves that extra's
-# drivers are installed (verified against cognee 1.6.1's optional-dependencies:
+# drivers are installed (verified against cognee 1.6.3's optional-dependencies:
 # fastembed and codegraph are empty extras there, their packages being core).
 # Probing the venv is deliberately preferred over recording installed extras in
 # venv-ready.json: that marker is shared with plugins that don't know about
@@ -1854,6 +1858,7 @@ async def _run_bootstrap(bootstrap: dict) -> None:
                 hook_log("bootstrap_waiting_for_peer", {"session_id": session_id})
         if not _wait_for_health(_SERVER_BOOT_DEADLINE_SECONDS, health_url):
             hook_log("bootstrap_server_unhealthy", {"session_id": session_id})
+            phase_end("setting_up", session_key=session_key, ok=False)
             return
 
     # 2. Register this agent/session. Runs for every agent — NOT gated by the
@@ -1871,8 +1876,10 @@ async def _run_bootstrap(bootstrap: dict) -> None:
             boot_timeout=_SERVER_BOOT_DEADLINE_SECONDS,
         )
         hook_log("bootstrap_complete", {"session_id": session_id})
+        phase_end("setting_up", session_key=session_key)
     except Exception as exc:
         hook_log("bootstrap_failed", {"error": str(exc)[:300]})
+        phase_end("setting_up", session_key=session_key, ok=False)
 
 
 def _running_server_observer(target_url: str) -> tuple[bool, bool | None]:
@@ -2063,6 +2070,24 @@ def _with_observer_note(output: dict, observer: dict) -> dict:
     return result
 
 
+def _mode_word(config: dict) -> str:
+    """The mode the user is told about, decided the way the status line decides
+    it: a forced backend first, then whether the target host is loopback.
+
+    By the time the message is built, ``config["base_url"]`` holds the target
+    the bootstrap filled in, which for a local session is the localhost default,
+    so "is a URL set" cannot tell local from cloud (it said cloud for every
+    local session, forced-local included).
+    """
+    forced = str(config.get("_forced_backend") or "")
+    if forced == "local":
+        return "local"
+    url = str(config.get("base_url") or "").strip()
+    if not url:
+        return "cloud" if forced == "cloud" else "local"
+    return "local" if _is_loopback_host(urllib.parse.urlparse(url).hostname or "") else "cloud"
+
+
 def _session_start_guidance(mode: str, dataset: str, session_id: str, ready: bool) -> dict:
     if ready:
         message = (
@@ -2091,14 +2116,39 @@ def _session_start_guidance(mode: str, dataset: str, session_id: str, ready: boo
     }
 
 
-def _ensure_statusline_configured() -> None:
+def _band_draws_this_session(session_id: str) -> bool:
+    """Whether the hooks module draws this session's status row above the prompt.
+
+    The module writes ``band/<session>.json`` at its own session start, which
+    runs before this hook, so the marker is already there when the module
+    loaded for this session. It is absent where the module cannot load (a
+    Claude Code older than the mods API, ``--safe-mode``, an organisation that
+    allows only its own mods) and where the band is switched off in ``/config``.
+    """
+    if not session_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
+        return False
+    marker = Path.home() / ".cognee-plugin" / "claude-code" / "band" / f"{session_id}.json"
+    try:
+        return marker.is_file()
+    except OSError:
+        return False
+
+
+def _ensure_statusline_configured(session_id: str = "") -> None:
     """Write the statusLine entry to ~/.claude/settings.json when safe.
 
-    Claude Code hot-reloads settings.json, so the status line becomes active on
-    the next status refresh without requiring a restart.
+    One row, whichever can be drawn: where the hooks module draws the row above
+    the prompt for this session, the settings file is left alone (the renderer
+    prints nothing for such a session anyway); where it does not, the line below
+    the prompt is installed, or refreshed when the plugin moved. Claude Code
+    hot-reloads settings.json, so the line becomes active on the next status
+    refresh without a restart.
     """
     if os.environ.get("COGNEE_STATUSLINE", "").lower() in {"0", "false", "no", "off"}:
         hook_log("statusline_setup_skipped", {"reason": "disabled_by_env"})
+        return
+    if _band_draws_this_session(session_id):
+        hook_log("statusline_setup_skipped", {"reason": "band_draws_row"})
         return
 
     plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
@@ -2174,13 +2224,9 @@ def _ensure_statusline_configured() -> None:
 
 
 _MEMORY_PREFERENCE_STEER = (
-    "Memory policy for this session: Cognee is the preferred, authoritative long-term "
-    "memory. On every user request, Cognee memory relevant to the prompt is "
-    "automatically recalled and injected into your context before you answer — consult "
-    "that recalled Cognee context FIRST. When you need to look up or store durable "
-    "information, use the Cognee tools/skills (cognee-search, cognee-remember) in "
-    "preference to Claude Code's built-in file memory (MEMORY.md), and do not duplicate "
-    "durable knowledge into MEMORY.md. Cognee is the source of truth for memory."
+    "Use cognee-search for memory and cognee-remember to save it. "
+    "Before searching, say 'Searching Cognee…' in progress text. "
+    "Briefly credit recalled memory only when used."
 )
 
 
@@ -2257,9 +2303,9 @@ def _apply_update_nudge(output: dict) -> dict:
 
 
 async def _start(payload: dict | None = None) -> dict:
-    _ensure_statusline_configured()
     config = load_config()
     payload = payload or {}
+    _ensure_statusline_configured(str(payload.get("session_id") or ""))
     cwd = str(payload.get("cwd") or os.environ.get("CLAUDE_CWD") or os.getcwd())
     # The service URL is the sole router (api_key is optional auth, with a
     # default-user fallback in registration). COGNEE_AGENT_MODE is NOT decided
@@ -2286,7 +2332,12 @@ async def _start(payload: dict | None = None) -> dict:
     # to add the fastembed extra, and the server inherits the provider variables
     # at spawn. The shim is started detached now so the server's first LLM call
     # (and the watcher's key check) find it listening.
-    observer = _apply_observer(config, target_url)
+    from _cloud_worker import enabled as cloud_enabled
+
+    cloud = cloud_enabled({"base_url": target_url})
+    observer = (
+        {"active": False, "reason": "cloud"} if cloud else _apply_observer(config, target_url)
+    )
 
     # NOTE: the local server's LLM_API_KEY health is deliberately NOT judged here.
     # A hook-env read (config's llm_api_key / OPENAI_API_KEY) is blind to a key that
@@ -2323,6 +2374,20 @@ async def _start(payload: dict | None = None) -> dict:
             }
         }
     os.environ["COGNEE_SESSION_KEY"] = session_key
+    if payload.get("source") in {"clear", "compact"}:
+        from _injection_ledger import reset as reset_injection_ledger
+        from _injection_ledger import session_dir as ledger_dir
+
+        try:
+            reset_injection_ledger(session_key)
+        except Exception as exc:
+            # Never block startup on the ledger. A stale ledger would claim the
+            # forgotten context is still present, so drop it instead.
+            hook_log("injection_ledger_failed", {"op": "reset", "error": str(exc)[:200]})
+            try:
+                (ledger_dir(session_key) / "injected.json").unlink()
+            except (OSError, ValueError):
+                pass
 
     # Resolve (and persist) this launch's record: session_id (data scoping, unique
     # per launch) + conn_uuid (liveness handle for registration/counting). Written
@@ -2364,6 +2429,34 @@ async def _start(payload: dict | None = None) -> dict:
         },
     )
 
+    if cloud:
+        from _cloud_worker import register_session
+
+        register_session(
+            {
+                "cwd": cwd,
+                "session_id": session_id,
+                "session_key": session_key,
+                "dataset": dataset,
+                "agent_session_name": agent_session_name,
+                "base_url": target_url,
+            }
+        )
+        touch_activity()
+        marker_ready = server_ready_hint(target_url)
+        message = (
+            "Cognee cloud memory ready; background synchronization active."
+            if marker_ready
+            else "Cognee cloud memory connecting in the background; captures are queued."
+        )
+        return {
+            "systemMessage": message,
+            "hookSpecificOutput": {
+                "hookEventName": "SessionStart",
+                "systemMessage": message,
+            },
+        }
+
     # Boot-vs-connect is decided purely by whether the server is already up:
     #   * up                -> connect (we don't boot, so agent mode is left as-is)
     #   * down + local URL  -> boot it; agent mode is set at the uvicorn spawn so
@@ -2380,6 +2473,7 @@ async def _start(payload: dict | None = None) -> dict:
     # are never booted. will_boot means "enter the local bootstrap path" — the
     # actual install/boot license is enforced inside _ensure_local_server_running,
     # so a busy server still gets a worker that waits for it instead of a boot.
+    phase_begin("connecting", session_key=session_key)
     presence_verdict, presence_evidence = "", {}
     if target_url and _is_local_url(target_url):
         presence_verdict, presence_evidence = server_presence(target_url, confirm_absent=False)
@@ -2418,6 +2512,7 @@ async def _start(payload: dict | None = None) -> dict:
         # The status line and the recall gate read the shared marker, not this
         # output: without this they would keep the previous session's verdict.
         write_connection_state("unreachable", target_url)
+        phase_end("connecting", session_key=session_key, ok=False)
         offline_message = (
             "## ⚠ Cognee Memory OFFLINE\n"
             f"The managed Cognee endpoint {target_url} is unreachable. "
@@ -2442,6 +2537,9 @@ async def _start(payload: dict | None = None) -> dict:
             },
         }
     if will_boot and _LAZY_BOOTSTRAP:
+        # The detached worker ends this phase once the server answers and the
+        # session is registered; the status surfaces show it meanwhile.
+        phase_begin("setting_up", "starting memory server", session_key=session_key)
         _spawn_bootstrap(config, cwd, session_id, agent_session_name, session_key, dataset)
         user_id = os.environ.get("COGNEE_USER_ID", "")
     else:
@@ -2458,8 +2556,10 @@ async def _start(payload: dict | None = None) -> dict:
         if not ok:
             if _LAZY_BOOTSTRAP and target_url and _is_local_url(target_url) and not managed_locked:
                 # Inline attempt failed; retry the heavy path out of band.
+                phase_begin("setting_up", "starting memory server", session_key=session_key)
                 _spawn_bootstrap(config, cwd, session_id, agent_session_name, session_key, dataset)
             else:
+                phase_end("connecting", session_key=session_key, ok=False)
                 return {}
 
     # Remove legacy resolved cache files. Runtime state now comes from HTTP endpoints.
@@ -2475,9 +2575,8 @@ async def _start(payload: dict | None = None) -> dict:
     # an immediate improve on startup.
     touch_activity()
 
-    # Launch the idle watcher (syncs session memory to graph after the agent
-    # goes idle). Runs in both local-server and cloud modes — the watcher picks
-    # the HTTP or local sync path itself. COGNEE_IDLE_DISABLED opts out.
+    # Launch the idle watcher (update and LLM-key checks, periodic shared-memory
+    # refresh). COGNEE_IDLE_DISABLED opts out.
     if os.environ.get("COGNEE_IDLE_DISABLED", "").lower() not in (
         "1",
         "true",
@@ -2494,7 +2593,7 @@ async def _start(payload: dict | None = None) -> dict:
         service_url=str(config.get("base_url", "") or ""),
     )
 
-    mode = "cloud" if config.get("base_url") else "local"
+    mode = _mode_word(config)
     print(
         f"cognee-plugin: session ready (mode={mode}, "
         f"session={session_id}, dataset={dataset}, user={user_id[:8]}...)",
@@ -2502,7 +2601,52 @@ async def _start(payload: dict | None = None) -> dict:
     )
 
     ready = server_live or server_ready_hint(str(config.get("base_url", "") or ""))
+    phase_end("connecting", session_key=session_key, ok=bool(ready))
     return _with_observer_note(_session_start_guidance(mode, dataset, session_id, ready), observer)
+
+
+def _apply_sync_notice(output: dict, payload: dict | None = None) -> dict:
+    """Say, on reopening a chat, whether it reached long-term memory (SDK-1071).
+
+    The session-end sync runs after the chat is gone, so its outcome is shown
+    when the same chat is resumed: resume keeps the session id, and the
+    session's improve record says when it was last sent or why the send
+    failed. Shown once per sync, in the terminal and to the agent, and only on
+    resume: a compaction keeps the session too, but lands mid-task, where an
+    idle or auto sync's notice would only interrupt. Off with
+    ``COGNEE_PLUGIN_CITE_MEMORY=off``.
+    """
+    if str((payload or {}).get("source") or "") != "resume":
+        return output
+    try:
+        import _plugin_common
+        from _recall_text import credit_enabled, mark_notice_shown, notice_due, sync_notice
+        from config import get_session_id
+
+        if not credit_enabled(_plugin_common.CITE_MEMORY_DEFAULT):
+            return output
+        session_id = get_session_id(load_config())
+        message, sync_ts = sync_notice(_plugin_common.read_improve_state(session_id))
+        if not message or not notice_due(_plugin_common._PLUGIN_DIR, session_id, sync_ts):
+            return output
+        mark_notice_shown(_plugin_common._PLUGIN_DIR, session_id, sync_ts)
+    except Exception as exc:
+        hook_log("sync_notice_failed", {"error": str(exc)[:200]})
+        return output
+    hook_log("sync_notice_shown", {"session": session_id, "sync_ts": sync_ts})
+
+    result = dict(output or {})
+    hso = dict(result.get("hookSpecificOutput") or {})
+    hso.setdefault("hookEventName", "SessionStart")
+    for field in ("systemMessage", "additionalContext"):
+        existing = str(hso.get(field) or "").strip()
+        hso[field] = f"{existing}\n\n{message}" if existing else message
+    result["hookSpecificOutput"] = hso
+    # The user sees only the top-level systemMessage: Claude Code documents it
+    # there (inside hookSpecificOutput it reached the agent but was never shown).
+    top = str(result.get("systemMessage") or "").strip()
+    result["systemMessage"] = f"{top}\n\n{message}" if top else message
+    return result
 
 
 def main():
@@ -2543,7 +2687,71 @@ def main():
             output = asyncio.run(_start(payload))
     except Exception as exc:
         hook_log("session_start_exception", {"error": str(exc)[:200]})
+    try:
+        from _auto_memory import sync as sync_auto_memory
+        from _cloud_worker import enabled as cloud_enabled
+
+        # Native memory is only taken over in cloud mode; anywhere else, give back
+        # a setting we changed earlier.
+        notice = sync_auto_memory(cloud_enabled())
+        if notice:
+            hso = output.setdefault("hookSpecificOutput", {"hookEventName": "SessionStart"})
+            hso["systemMessage"] = (str(hso.get("systemMessage") or "") + "\n" + notice).strip()
+            output["systemMessage"] = hso["systemMessage"]
+    except Exception as exc:
+        hook_log("auto_memory_setup_failed", {"error": str(exc)[:200]})
+    try:
+        if payload.get("source") != "resume":
+            from _session_stats import previous, summary
+            from _session_stats import update as update_stats
+
+            config = load_config()
+            key = get_session_key()
+            last_line = summary(
+                previous(key, get_dataset(config), str(config.get("base_url") or ""))
+            )
+            update_stats(
+                key,
+                metadata={
+                    "dataset": get_dataset(config),
+                    "server_url": str(config.get("base_url") or ""),
+                },
+            )
+            if last_line:
+                hso = output.setdefault("hookSpecificOutput", {"hookEventName": "SessionStart"})
+                hso["systemMessage"] = (
+                    str(hso.get("systemMessage") or "") + "\n" + last_line
+                ).strip()
+                hso["additionalContext"] = (
+                    str(hso.get("additionalContext") or "") + "\n" + last_line
+                ).strip()
+                output["systemMessage"] = hso["systemMessage"]
+    except Exception as exc:
+        # The recap is a courtesy; it must never cost the startup output.
+        hook_log("session_stats_failed", {"op": "recap", "error": str(exc)[:200]})
     output = _apply_memory_preference(output)
+    if payload.get("source") != "resume":
+        try:
+            from _cloud_worker import enabled as cloud_enabled
+            from _context_cache import inject as inject_digest
+
+            digest = (
+                inject_digest(
+                    get_dataset(load_config()), get_session_key(), source=payload.get("source", "")
+                )
+                if cloud_enabled()
+                else ""
+            )
+            if digest:
+                # Lead with the digest, keeping what is already there (the
+                # last-session line, and the steer when the user has not opted out).
+                hso = output.setdefault("hookSpecificOutput", {"hookEventName": "SessionStart"})
+                existing = str(hso.get("additionalContext") or "").strip()
+                hso["additionalContext"] = f"{digest}\n\n{existing}" if existing else digest
+        except Exception as exc:
+            # A missing, busy or malformed cache must never cost the startup output.
+            hook_log("context_digest_inject_failed", {"error": str(exc)[:200]})
+    output = _apply_sync_notice(output, payload)
     output = _apply_update_nudge(output)
     output = _apply_host_python_warning(output)
     print(json.dumps(output or {}))

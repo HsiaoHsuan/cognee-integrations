@@ -25,13 +25,17 @@ def ss(suite, hook_module):
     return module
 
 
-def test_steer_injected_by_default(ss):
+def test_steer_injected_by_default(ss, suite):
     out = ss._apply_memory_preference(
         {"hookSpecificOutput": {"hookEventName": "SessionStart", "systemMessage": "hi"}}
     )
     hook_specific = out["hookSpecificOutput"]
     assert "Cognee" in hook_specific["additionalContext"]
-    assert "FIRST" in hook_specific["additionalContext"]  # "consult Cognee FIRST"
+    if suite.name == "claude-code":
+        assert "cognee-search" in hook_specific["additionalContext"]
+        assert len(hook_specific["additionalContext"]) < 180
+    else:
+        assert "FIRST" in hook_specific["additionalContext"]
     assert hook_specific["systemMessage"] == "hi"  # existing fields preserved
     assert hook_specific["hookEventName"] == "SessionStart"
 

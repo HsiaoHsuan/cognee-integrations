@@ -1,6 +1,15 @@
 ---
 name: cognee-code
-description: Index a code repository into Cognee's code graph and query it deterministically (callers, impact analysis, paths, endpoints). Use for structural code questions, "index this repo", and checking what a re-index changed.
+description: >-
+  Index a repository (local path or git URL) into Cognee's code graph and answer exact
+  structural queries with no LLM calls: callers, dependencies, impact of changing a
+  symbol, call paths, endpoints, re-index changes.
+when_to_use: >-
+  E.g. "index this repo", "what calls or uses X?", "what breaks if I change X?", "how
+  does A reach B?", "list all API endpoints", "what did the last re-index change?". Not
+  for overviews, hotspots, diagrams or a whole change's impact (cognee-architecture),
+  conceptual questions naming no symbol (cognee-search), storing one file
+  (cognee-remember), or ordinary edits or debugging.
 ---
 
 # Cognee Code Graph
@@ -9,6 +18,16 @@ Build and query an architectural graph of a codebase (symbols, calls, imports,
 endpoints, dependencies) via Cognee's enola-backed pipeline. Requires a Cognee
 server >= 1.5.3. Indexing makes **no LLM or embedding calls** — it is fast,
 deterministic, and token-free.
+
+
+## Visible search progress
+
+Before running a Cognee search, send one short user-visible progress sentence,
+for example: "Searching Cognee for the earlier decision…" or "Checking Cognee's
+code graph for callers of this function…". Name Cognee in the normal working
+text before the tool call; keep this to one update per related search batch.
+Afterwards, describe relevant findings, an empty result, or a failed search
+accurately. Do not claim Cognee improved the answer merely because a search ran.
 
 ## Index a repository
 
@@ -98,6 +117,8 @@ match). With it, pick one exact operation:
 | `traverse` | follow edges from seeds | `{"operation":"traverse","start":"main","direction":"forward","max_depth":3}` |
 | `find_path` | how A reaches B | `{"operation":"find_path","source":"AuthMiddleware","target":"Database"}` |
 | `impact_analysis` | what breaks if X changes | `{"operation":"impact_analysis","targets":["process_payment"]}` |
+| `architecture` (>=1.6.3) | module, route, storage and service map | `{"operation":"architecture","diagram":"mermaid"}` |
+| `insights` (>=1.6.3) | explainer findings with cited facts | `{"operation":"insights","diagram":"mermaid"}` |
 | `delta` | what the last index changed | `{"operation":"delta"}` |
 
 An ambiguous seed returns an error **listing the candidates** — pick one and

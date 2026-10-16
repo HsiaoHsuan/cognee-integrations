@@ -208,6 +208,7 @@ export function serverMock(): Record<string, jest.Mock> {
     resolveOrMintApiKey: jest.fn(async () => "test-api-key"),
     spawnExitWatcher: jest.fn(async () => {}),
     exitWatcherPidfilePath: jest.fn((name: string) => `/tmp/exit-watchers/${name}.pid`),
+    writeExitWatcherBridge: jest.fn(async () => {}),
   };
 }
 

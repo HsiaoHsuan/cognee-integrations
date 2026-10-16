@@ -31,6 +31,10 @@ USER_AGENT = "cognee-memory-plugin" + (f"/{_VERSION}" if _VERSION else "")
 
 
 def install() -> None:
+    # Plain urlopen() reuses a global opener cached by an earlier call; it predates the patch.
+    cached = getattr(urllib.request, "_opener", None)
+    if cached is not None:
+        cached.addheaders = [("User-agent", USER_AGENT)]
     init = urllib.request.OpenerDirector.__init__
     # Isolated test imports reload this module; wrapping again would stack.
     if getattr(init, "_cognee_ua", False):

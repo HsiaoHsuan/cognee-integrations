@@ -1,6 +1,15 @@
 ---
 name: cognee-standup
-description: A standup or status update built from the coding-agent sessions Cognee recorded — prompts, tool calls, edited files, what was left open — per project. Use only when the user explicitly asks for a standup, a status update, a catch-up on their own recent sessions ("what did I work on yesterday / this week"), or invokes /cognee-standup. Not for questions about code, files or the current task.
+description: >-
+  A standup or status update on the user's own recent work, from the coding-agent
+  sessions Cognee recorded (prompts, edited files, what was left open) per project.
+  Default last 24h; also today, yesterday, 48h or a date.
+when_to_use: >-
+  E.g. "prep my standup", "status update on my work", "what did I work on yesterday?",
+  "what did I do today?", "where did I leave off?", "what did I leave unfinished?". Not
+  for a week or longer (cognee-digest), one topic's history (cognee-timeline), Cognee's
+  performance (cognee-report), a morning brief, git, PR or ticket status, or summarizing
+  this conversation.
 ---
 
 # Cognee Standup

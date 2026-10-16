@@ -216,7 +216,7 @@ describe("recall budget + circuit breaker", () => {
 
       const { api, emit } = createApi();
       const pending = emit("before_prompt_build", { prompt: "what did we discuss" }, { agentId: "will" });
-      await jest.advanceTimersByTimeAsync(12_500); // past the 12s default budget
+      await jest.advanceTimersByTimeAsync(20_500); // past the 20s default budget
       const results = await pending;
 
       expect(results.find((r) => r !== undefined)).toBeUndefined();
@@ -226,13 +226,76 @@ describe("recall budget + circuit breaker", () => {
     }
   });
 
-  it("passes the short recall timeout to the client", async () => {
+  it("passes the recall timeout to the client", async () => {
     mockRecall.mockResolvedValue([]);
     datasetState = { testds: "good-id" };
 
     const { emit } = createApi();
     await emit("before_prompt_build", { prompt: "what did we discuss" }, { agentId: "will" });
 
-    expect(mockRecall).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs: 10_000 }));
+    // The per-call timeout (20s) equals the budget, so the call gets what is
+    // left of the budget: just under 20s.
+    const timeoutMs = (mockRecall.mock.calls[0]![0] as { timeoutMs: number }).timeoutMs;
+    expect(timeoutMs).toBeLessThanOrEqual(20_000);
+    expect(timeoutMs).toBeGreaterThan(19_000);
+  });
+});
+
+describe("slow streak", () => {
+  const timeout = () => Object.assign(new Error("The operation was aborted"), { name: "AbortError" });
+
+  it("after three timed-out recalls, probes /health first and skips recall while the server does not answer", async () => {
+    datasetState = { testds: "good-id" };
+    mockRecall.mockRejectedValue(timeout());
+    const fetchSpy = jest.spyOn(global, "fetch").mockRejectedValue(new TypeError("fetch failed"));
+    try {
+      const { api, emit } = createApi();
+      for (let i = 0; i < 3; i++) await emit("before_prompt_build", { prompt: "what did we discuss" }, { agentId: "will" });
+      expect(mockRecall).toHaveBeenCalledTimes(3);
+      expect(fetchSpy).not.toHaveBeenCalled();
+
+      await emit("before_prompt_build", { prompt: "what did we discuss" }, { agentId: "will" });
+      expect(fetchSpy).toHaveBeenCalledWith(expect.stringMatching(/\/health$/), expect.anything());
+      expect(mockRecall).toHaveBeenCalledTimes(3);
+      expect(api.logger.info).toHaveBeenCalledWith(expect.stringContaining("not responding"));
+
+      // The server answers again: recall resumes, and a success ends the streak.
+      fetchSpy.mockResolvedValue(new Response("{}", { status: 200 }));
+      mockRecall.mockResolvedValue([]);
+      await emit("before_prompt_build", { prompt: "what did we discuss" }, { agentId: "will" });
+      expect(mockRecall).toHaveBeenCalledTimes(4);
+      fetchSpy.mockClear();
+      await emit("before_prompt_build", { prompt: "what did we discuss" }, { agentId: "will" });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+});
+
+describe("a dataset created after the first prompt", () => {
+  it("is found once the cached miss expires, instead of staying invisible until a restart", async () => {
+    datasetState = {};
+    mockListDatasets.mockResolvedValue([]); // fresh install: nothing yet
+    mockRecall.mockResolvedValue([{ id: "r1", text: "hello", score: 0.9 }]);
+    const { emit } = createApi();
+
+    await emit("before_prompt_build", { prompt: "what did we discuss" }, { agentId: "will" });
+    expect(mockRecall).not.toHaveBeenCalled();
+
+    // The first capture or sync creates it on the server.
+    mockListDatasets.mockResolvedValue([{ id: "new-id", name: "testds" }]);
+    await emit("before_prompt_build", { prompt: "what did we discuss" }, { agentId: "will" });
+    expect(mockListDatasets).toHaveBeenCalledTimes(1); // the miss is still cached: no listing per prompt
+
+    const now = Date.now();
+    const clock = jest.spyOn(Date, "now").mockReturnValue(now + 31_000);
+    try {
+      await emit("before_prompt_build", { prompt: "what did we discuss" }, { agentId: "will" });
+    } finally {
+      clock.mockRestore();
+    }
+    expect(mockListDatasets).toHaveBeenCalledTimes(2);
+    expect(mockRecall).toHaveBeenCalledWith(expect.objectContaining({ datasetIds: ["new-id"] }));
   });
 });

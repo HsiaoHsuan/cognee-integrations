@@ -269,9 +269,36 @@ def env_file_status() -> dict:
     return info
 
 
+def append_env_value(name: str, value: str) -> Path:
+    """Append ``NAME="value"`` to the env file (``COGNEE_ENV_FILE`` honoured),
+    creating it owner-only. One line; the value may not hold a newline."""
+    if not name or not all(c.isalnum() or c == "_" for c in name):
+        raise ValueError("not a variable name")
+    if "\n" in value or "\r" in value:
+        raise ValueError("one line only")
+    path = env_file_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text(encoding="utf-8") if path.is_file() else ""
+    head = existing if not existing or existing.endswith("\n") else existing + "\n"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    with os.fdopen(os.open(path, flags, 0o600), "w", encoding="utf-8") as handle:
+        handle.write(f'{head}{name}="{value}"\n')
+    _tighten_permissions(path)
+    return path
+
+
 if __name__ == "__main__":
     import json
 
+    if len(sys.argv) >= 3 and sys.argv[1] == "--append":
+        # The value comes on stdin, never on the command line (ps would show it).
+        try:
+            written = append_env_value(sys.argv[2], sys.stdin.read().strip())
+        except Exception as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+        print(written)
+        sys.exit(0)
     load_env_file()
     json.dump(env_file_status(), sys.stdout, indent=2)
     print()

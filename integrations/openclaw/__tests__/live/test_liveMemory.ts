@@ -225,7 +225,9 @@ async function turn(
   // the assertion is that the plugin degraded (warned) rather than threw, so wait
   // for the failure line instead of treating it as fatal.
   if (expectStoreFailure) {
-    await waitForLog(harness, /qa store failed/, "qa capture (expected to fail)", 60_000, false);
+    // An unreachable server never received the write, so it is queued for
+    // replay (write-buffer.ts) rather than dropped; either way it fails quietly.
+    await waitForLog(harness, /qa (store failed|buffered until the Cognee server is reachable)/, "qa capture (expected to fail)", 60_000, false);
     return;
   }
   await waitForLog(harness, /qa stored/, "qa capture");
@@ -427,7 +429,8 @@ suite("live memory chain", () => {
           prompt: "anything at all",
           answer: "an answer",
           sessionId: "live-outage",
-          // The store cannot succeed here; the contract is that it fails quietly.
+          // The store cannot succeed here; the contract is that it fails quietly
+          // (the write is buffered for when the server is back).
           expectStoreFailure: true,
         }),
       ).resolves.toBeUndefined();

@@ -47,13 +47,17 @@ _COUNTER_FILE = _PLUGIN_DIR / "counter.json"
 _ACTIVITY_FILE = _PLUGIN_DIR / "activity.ts"
 _ACTIVITY_LOG = _PLUGIN_DIR / "activity.log"
 _SAVE_COUNTER = _PLUGIN_DIR / "save_counter.json"
+#: Whether credit tags and the resume notice are on when
+#: ``COGNEE_PLUGIN_CITE_MEMORY`` is unset (SDK-1071). Off on Codex, which shows the
+#: injected instruction in the terminal, until it has been tried live.
+CITE_MEMORY_DEFAULT = False
 _SERVER_READY_MARKER = _SHARED_PLUGIN_ROOT / "server-ready.json"
 _SERVER_READY_TTL_SECONDS = 30
 # One state file per session (see record_improve_success / record_improve_failure):
 # when the last improve attempt ran, whether it landed, and how many turns the
-# session had at the last success. Every improve trigger records it; the idle
-# and auto triggers consult it so the cooldown (and the failure backoff) survive
-# the watcher's exit-after-bridge respawn cycle.
+# session had at the last success. Every improve trigger records it; the auto
+# trigger consults it so the cooldown (and the failure backoff) survive across
+# hook processes.
 _IMPROVE_STATE_DIR = _PLUGIN_DIR / "improve-state"
 # Per-agent-session buffer dirs. Each agent session (one Claude/Codex terminal)
 # owns its own file under these dirs, so two concurrent agents never
@@ -840,8 +844,32 @@ def list_writable_datasets(user_id: str = "", *, timeout: float = 15.0) -> dict:
     """
     items = list_readable_datasets(timeout=timeout)
     if not user_id:
-        me = _json_http_request("/api/v1/users/me", method="GET", timeout=timeout)
-        user_id = str(me.get("id") or "") if isinstance(me, dict) else ""
+        # The key's own user, from the data plane: the connection lookup serves
+        # it with or without a session name (the key identifies the user), on
+        # cloud tenants and OSS servers alike; session start reads it there too.
+        try:
+            conn = _json_http_request(
+                "/api/v1/agents/connections/me", method="GET", timeout=timeout
+            )
+            agent = conn.get("agent") if isinstance(conn, dict) else None
+            user_id = str(agent.get("user_id") or "").strip() if isinstance(agent, dict) else ""
+        except urllib.error.HTTPError as exc:
+            hook_log(
+                "runtime_state_connection_lookup_failed",
+                {"status": exc.code, "where": "list_datasets"},
+            )
+    if not user_id and not _platform_host_for(_local_api_url()):
+        # /users/me is the identity route of an OSS server, where no connection
+        # may exist yet. A cloud tenant host has none: that route lives on the
+        # platform API (api.<env>), where it answers account settings without
+        # an id, so a tenant is not asked. Without an id the write check is
+        # skipped and every readable dataset is offered, ``writable`` unknown,
+        # rather than no listing at all.
+        try:
+            me = _json_http_request("/api/v1/users/me", method="GET", timeout=timeout)
+            user_id = str(me.get("id") or "") if isinstance(me, dict) else ""
+        except urllib.error.HTTPError as exc:
+            hook_log("users_me_lookup_failed", {"status": exc.code, "where": "list_datasets"})
     writable_ids = None
     if user_id:
         try:
@@ -878,6 +906,7 @@ def list_writable_datasets(user_id: str = "", *, timeout: float = 15.0) -> dict:
             writable = True if owner and (owner == user_id or via_role) else None
         rows.append({**item, "writable": writable})
     return {
+        "user_id": user_id,
         "datasets": [row for row in rows if row["writable"] is not False],
         "readonly": [row["name"] for row in rows if row["writable"] is False],
         "readonly_ids": [row["id"] for row in rows if row["writable"] is False],
@@ -1172,9 +1201,26 @@ def load_resolved(session_key: str = "", *, identity: bool = True) -> dict:
     except Exception as exc:
         hook_log("runtime_state_connection_lookup_failed", {"error": str(exc)[:200]})
 
-    # Fallback identity probe — only when the connection lookup yielded none
-    # (e.g. before registration on a fresh launch).
-    if not resolved.get("user_id"):
+    # The connection named above may not exist yet (a fresh launch, a tenant
+    # the session was not registered on). The key's own user is the same on
+    # every connection of the key, so any connection of it answers.
+    if conn_uuid and not resolved.get("user_id"):
+        try:
+            conn = _json_http_request("/api/v1/agents/connections/me", method="GET", timeout=10.0)
+            agent = conn.get("agent") if isinstance(conn, dict) else None
+            user_id = str(agent.get("user_id") or "").strip() if isinstance(agent, dict) else ""
+            if user_id:
+                resolved["user_id"] = user_id
+        except Exception as exc:
+            hook_log(
+                "runtime_state_connection_lookup_failed",
+                {"error": str(exc)[:200], "where": "any_connection"},
+            )
+
+    # Fallback identity probe — only when no connection answered, and never on
+    # a cloud tenant host, which has no /users/me (the platform API's copy
+    # answers account settings without an id).
+    if not resolved.get("user_id") and not _platform_host_for(service_url):
         try:
             me = _json_http_request("/api/v1/users/me", method="GET", timeout=10.0)
             if isinstance(me, dict):
@@ -1541,6 +1587,68 @@ def bump_save_counter(session_id: str, kind: str, *, buffered: bool = False) -> 
         _SAVE_COUNTER.write_text(json.dumps(data), encoding="utf-8")
     except Exception as exc:
         hook_log("save_counter_write_failed", {"path": str(_SAVE_COUNTER), "error": str(exc)[:200]})
+    _bump_stored_seq(get_session_key() or session_id)
+
+
+def _stored_seq_path(session_key: str):
+    """``stored.log`` in the session's state folder (see ``read_stored_seq``)."""
+    from _recall_text import session_state_dir
+
+    folder = session_state_dir(_PLUGIN_DIR, session_key)
+    return folder / "stored.log" if folder else None
+
+
+def _bump_stored_seq(session_key: str) -> None:
+    """Advance the session's running stored-item count by one.
+
+    Appends one byte instead of rewriting a count: an append this small is
+    atomic, so parallel store hooks need no lock, nothing is read back, and
+    the count can only grow. One file per session, so no session can wipe
+    another's.
+    """
+    path = _stored_seq_path(session_key)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            # Windows emulates O_APPEND as a seek then a write, two steps that
+            # interleave across handles, so parallel hooks lost bytes there.
+            from _file_lock import file_lock
+
+            with file_lock(path.with_suffix(".lock"), timeout=5.0) as acquired:
+                if not acquired:
+                    raise OSError("stored.log lock busy")
+                _append_one_byte(path)
+        else:
+            _append_one_byte(path)
+    except OSError as exc:
+        hook_log("stored_seq_write_failed", {"error": str(exc)[:200]})
+
+
+def _append_one_byte(path) -> None:
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, b".")
+    finally:
+        os.close(fd)
+
+
+def read_stored_seq(session_key: str) -> int:
+    """How many items this session has stored so far, buffered ones included.
+
+    Unlike the save counter it is never reset, so a later value means the
+    session stored something new. The session-end sync keys its dedupe marker
+    on it: the two workers of one exit share a value, a later exit after new
+    turns does not.
+    """
+    path = _stored_seq_path(session_key)
+    if path is None:
+        return 0
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def read_and_reset_save_counter(session_id: str) -> dict:
@@ -1822,11 +1930,11 @@ def read_turn_count(session_id: str) -> int:
         return 0
 
 
-IMPROVE_COOLDOWN_DEFAULT_SECONDS = 5400.0
+IMPROVE_COOLDOWN_DEFAULT_SECONDS = 24 * 60 * 60.0
 
 
 def improve_cooldown_seconds() -> float:
-    """Minimum seconds between idle/auto improves of one session (COGNEE_IMPROVE_COOLDOWN)."""
+    """Minimum seconds between auto improves of one session (COGNEE_IMPROVE_COOLDOWN)."""
     raw = os.environ.get("COGNEE_IMPROVE_COOLDOWN", "").strip()
     try:
         value = float(raw) if raw else IMPROVE_COOLDOWN_DEFAULT_SECONDS
@@ -1854,7 +1962,7 @@ def record_improve_success(session_id: str, dataset: str, trigger: str) -> None:
     Called by ``run_session_improve_detailed`` itself on a confirmed 2xx submit,
     never by its callers, so a skipped or failed attempt can never be stamped as
     a success. Replaces the whole state, which also clears any failure backoff.
-    The idle/auto triggers read this back through ``improve_throttle_reason``.
+    The auto trigger reads this back through ``improve_throttle_reason``.
     Best-effort: a write failure is logged and never fails the improve.
     """
     if not session_id:
@@ -1903,15 +2011,15 @@ def record_improve_failure(session_id: str, dataset: str, trigger: str, reason: 
 
 
 def improve_throttle_reason(session_id: str) -> str:
-    """Why an idle/auto improve of ``session_id`` should be skipped right now.
+    """Why an auto improve of ``session_id`` should be skipped right now.
 
     ``"cooldown"`` while the last successful improve is younger than
     ``improve_cooldown_seconds()``; ``"backoff"`` while the last FAILED attempt
     (busy, timeout, unreachable...) is; ``"no_new_entries"`` when nothing was
     stored since the last success; ``""`` when an improve may run. A session that
-    never attempted an improve is never throttled. Only the automatic triggers
-    (idle watcher, every-N entries) honour this — the session-end, manual and
-    dataset-switch syncs always run.
+    never attempted an improve is never throttled. Only the automatic every-N
+    entries trigger honours this — the session-end, manual and dataset-switch
+    syncs always run.
     """
     state = read_improve_state(session_id)
     if not state:
@@ -4488,25 +4596,40 @@ def elapsed_ms(start: float) -> int:
 _TYPED_DATASET_CAPABILITIES = {}
 
 
+def _openapi_request_properties(spec: dict, path: str, method: str = "post") -> set:
+    """The property names of an operation's request body, ``$ref`` resolved."""
+    op = spec.get("paths", {}).get(path, {}).get(method, {})
+    content = op.get("requestBody", {}).get("content", {}) if isinstance(op, dict) else {}
+    names: set = set()
+    for media in content.values():
+        schema = media.get("schema", {}) if isinstance(media, dict) else {}
+        ref = str(schema.get("$ref") or "")
+        if ref.startswith("#/components/schemas/"):
+            schema = spec.get("components", {}).get("schemas", {}).get(ref.rsplit("/", 1)[-1], {})
+        props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        names |= set(props)
+    return names
+
+
 def require_typed_dataset_id_support(*, service_url: str = "", api_key=None) -> None:
-    """Old SDKs advertise dataset_id but reject typed entries at runtime."""
+    """A write addressed by dataset UUID needs ``POST /api/v1/remember/entry`` to
+    take ``dataset_id``. The server's own API description says whether it does:
+    the request body of that operation lists the field (every server since the
+    V1 routes), and an older one does not. Cached a minute per server."""
     url = _normalize_service_url(service_url or _local_api_url())
     cached = _TYPED_DATASET_CAPABILITIES.get(url)
     supported = cached[1] if cached else False
     if cached is None or time.monotonic() - cached[0] > 60.0:
         spec = _json_http_request("/openapi.json", method="GET", base_url=url, api_key=api_key)
-        supported = (
-            spec.get("paths", {})
-            .get("/api/v1/remember/entry", {})
-            .get("post", {})
-            .get("x-cognee-session-dataset-ids")
-            is True
+        supported = "dataset_id" in _openapi_request_properties(
+            spec if isinstance(spec, dict) else {}, "/api/v1/remember/entry"
         )
         _TYPED_DATASET_CAPABILITIES[url] = (time.monotonic(), supported)
     if not supported:
         raise RuntimeError(
-            "This Cognee server cannot safely store typed session memory by dataset UUID. "
-            "Update the SDK before selecting a shared write dataset."
+            "This Cognee server cannot safely store typed session memory by dataset UUID "
+            "(its POST /api/v1/remember/entry takes no dataset_id). "
+            "Update the server before selecting a shared write dataset."
         )
 
 
@@ -5375,8 +5498,8 @@ def ensure_dataset_via_http(dataset: str) -> None:
 def run_session_improve_detailed(dataset: str, session_id: str, *, trigger: str = "final") -> dict:
     """API-mode session->graph sync: drain warmup entries, then ONE improve submit.
 
-    ``trigger`` names the caller (``idle``, ``auto``, ``final``, ``manual``,
-    ``switch``) and is recorded with the session's improve state. Returns
+    ``trigger`` names the caller (``auto``, ``final``, ``manual``, ``switch``)
+    and is recorded with the session's improve state. Returns
     ``{"ok": bool, "reason": str, "error": str}``: ``ok`` when the improve landed
     and the drain was complete; otherwise ``reason`` is ``busy`` (another improve
     of this session is in flight server-side), ``unreachable`` (backend down,
@@ -5396,7 +5519,7 @@ def run_session_improve_detailed(dataset: str, session_id: str, *, trigger: str 
         result: dict = {"ok": False, "error": "backend unreachable"}
         reason = "unreachable"
     else:
-        # Detached/idle context: nothing user-visible waits on this, so the drain
+        # Detached context: nothing user-visible waits on this, so the drain
         # gets a far larger budget than the per-prompt hook's default.
         final_budget = _float_env("COGNEE_DRAIN_BUDGET_FINAL", 120.0)
         _, remaining = drain_warmup_entries(dataset, session_id, budget_seconds=final_budget)
@@ -5593,6 +5716,23 @@ def sweep_stale_state(now: Optional[float] = None) -> dict:
             (_IMPROVE_STATE_DIR, "improve_state"),
         ):
             _sweep_dir_by_age(directory, _SWEEP_SESSION_FILE_MAX_AGE_SECONDS, now, counts, key)
+        sessions = _PLUGIN_DIR / "sessions"
+        if sessions.is_dir():
+            for directory in sessions.iterdir():
+                if not directory.is_dir() or directory.is_symlink():
+                    continue
+                # One session directory must not stop the rest of the sweep
+                # (log rotation included): a temp file can vanish between
+                # iterdir() and stat(), and a directory may not be removable.
+                try:
+                    newest = max((p.stat().st_mtime for p in directory.iterdir()), default=0)
+                    if now - newest > _SWEEP_SESSION_FILE_MAX_AGE_SECONDS:
+                        shutil.rmtree(directory)
+                        counts["sessions"] = counts.get("sessions", 0) + 1
+                except OSError as exc:
+                    counts.setdefault("errors", []).append(
+                        f"sessions/{directory.name}: {str(exc)[:80]}"
+                    )
         _sweep_pending_husks(counts)
         _sweep_launch_records(now, counts)
         for name in _SWEEP_LEGACY_FILES:

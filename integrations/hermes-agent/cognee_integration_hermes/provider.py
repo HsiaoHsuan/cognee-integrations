@@ -200,6 +200,8 @@ class CogneeMemoryProvider(MemoryProvider):
         # flight — see queue_prefetch / on_session_switch.
         self._prefetch_generation = 0
         self._sync_thread: Optional[threading.Thread] = None
+        # The best-effort improve on_pre_compress starts; one at a time per provider.
+        self._pre_compress_thread: Optional[threading.Thread] = None
         # The breaker is touched from the main thread and every worker thread
         # (prefetch, sync, memory-write); the lock keeps the failure counter's
         # read-modify-writes from losing updates under that concurrency.
@@ -676,6 +678,57 @@ class CogneeMemoryProvider(MemoryProvider):
             return
         self._improve_inline()
 
+    def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
+        """Bridge the session into the graph before Hermes compresses it away.
+
+        Best-effort (Hermes pre-compress checkpoint API v1): the improve runs on a
+        worker so compression never waits on a graph build, a failure is logged and
+        never raised, and no text is contributed to the summary prompt. The
+        session-end improve still runs; this only stops long sessions from losing
+        compressed-away turns that never reached the graph.
+        """
+        try:
+            if (
+                not messages
+                or not self._session_cognee_id
+                or not self._is_usable()
+                or not self._writes_enabled
+                or not self._improve_on_end
+                or self._is_breaker_open()
+            ):
+                return ""
+            if self._pre_compress_thread and self._pre_compress_thread.is_alive():
+                return ""  # the previous compaction's improve is still running
+            dataset, session_id, sync_thread = (
+                self._dataset,
+                self._session_cognee_id,
+                self._sync_thread,
+            )
+
+            def _improve() -> None:
+                # The latest turn has to be in the session cache before it is bridged.
+                if sync_thread and sync_thread.is_alive():
+                    sync_thread.join(timeout=10.0)
+                try:
+                    self._backend.improve(
+                        dataset=dataset,
+                        session_ids=[session_id],
+                        background=False,
+                        timeout=self._timeout("improve_timeout", 300),
+                    )
+                    self._record_success()
+                except Exception as exc:
+                    self._record_failure()
+                    logger.warning("Cognee pre-compress improve failed: %s", exc)
+
+            self._pre_compress_thread = threading.Thread(
+                target=_improve, daemon=True, name="cognee-hermes-pre-compress"
+            )
+            self._pre_compress_thread.start()
+        except Exception as exc:
+            logger.warning("Cognee pre-compress improve failed: %s", exc)
+        return ""
+
     def _hand_off_session_close(self) -> bool:
         """Give improve-then-unregister to a detached worker. True when it took them.
 
@@ -820,7 +873,7 @@ class CogneeMemoryProvider(MemoryProvider):
         self.sync_turn(content, "", session_id=self._session_id)
 
     def shutdown(self) -> None:
-        for thread in (self._prefetch_thread, self._sync_thread):
+        for thread in (self._prefetch_thread, self._sync_thread, self._pre_compress_thread):
             if thread and thread.is_alive():
                 thread.join(timeout=5.0)
         if self._close_handed_off:

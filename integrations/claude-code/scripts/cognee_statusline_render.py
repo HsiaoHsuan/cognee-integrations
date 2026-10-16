@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -35,8 +37,15 @@ _UPDATE_CHECK_PATH = _SHARED_ROOT / "claude-code" / "update-check.json"
 # only signal that clears the update nudge mid-session (see _update_segment).
 _INSTALLED_PLUGINS_PATH = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
 _LLM_STATE_PATH = _SHARED_ROOT / "claude-code" / "llm-state.json"
+# Live activity (see _plugin_common.phase_begin): what memory is doing now and
+# the last thing it finished, per host session.
 _RECALL_PATH = _SHARED_ROOT / "claude-code" / "last_recall.json"
 _RECALL_DIR = _SHARED_ROOT / "claude-code" / "recall"
+_PHASE_DIR = _SHARED_ROOT / "claude-code" / "phase"
+# Written by the plugin's hooks module for a session whose status row it draws
+# above the prompt (the band); this renderer then prints nothing for that
+# session, so the row is never shown twice. Keyed by host session id.
+_BAND_DIR = _SHARED_ROOT / "claude-code" / "band"
 _CREDITS_PATH = _SHARED_ROOT / "claude-code" / "credits.json"
 # Per-session copies (see _plugin_common._write_session_marker): the shared files
 # above are coordination state, these are what THIS terminal observed.
@@ -554,6 +563,9 @@ def _evict_own_statusline() -> None:
     user set themselves is never touched. Atomic replace to avoid a torn file.
     """
     try:
+        from _auto_memory import restore as restore_auto_memory
+
+        restore_auto_memory()
         settings = _read_json(_USER_SETTINGS)
         sl = settings.get("statusLine")
         cmd = sl.get("command", "") if isinstance(sl, dict) else ""
@@ -621,6 +633,194 @@ def _llm_prefix(session_id: str = "") -> str:
     return ""
 
 
+# An ``active`` phase older than this is a hook that died mid-flight (or a
+# marker a previous session left); it must not keep the bar "recalling…" forever.
+_PHASE_STALE_SECONDS = 90.0
+# A finished result stays on the bar until the next phase begins, faint once it
+# is this old so "recalled 3 memories" reads as recent versus left over.
+_RESULT_DIM_AFTER_SECONDS = 60.0
+# A result older than this is no longer news: the segment leaves the line.
+_RESULT_HIDE_AFTER_SECONDS = 300.0
+_ACTIVE_STYLE = "\033[33m"  # yellow: something is happening right now (local mode is cyan)
+_DIM = "\033[2m"
+
+# One user-facing phrase per phase, present tense while it runs. The vocabulary
+# is deliberately plain: "memories" is the only noun, and the idle improve pass
+# is "learning from this session", which is what it does.
+_ACTIVE_LABELS = {
+    "connecting": "connecting…",
+    "setting_up": "setting up memory",
+    "recalling": "recalling…",
+    "saving": "saving…",
+    "consolidating": "learning from this session…",
+    "indexing": "indexing repository…",
+    "anchoring": "preserving context…",
+    "syncing": "saving session…",
+}
+
+
+def _band_draws_row(session_id: str) -> bool:
+    """True when the hooks module draws this session's row above the prompt.
+
+    Only this session's marker counts: a terminal without the module (an older
+    Claude Code, ``--safe-mode``, a managed org) keeps its status line.
+    """
+    if not session_id or not _path_safe(session_id):
+        return False
+    return (_BAND_DIR / f"{session_id}.json").is_file()
+
+
+def _phase_marker(session_id: str) -> dict:
+    """This session's activity marker, or {} when there is none to attribute.
+
+    Keyed by the host session id from stdin, so with several terminals open each
+    bar shows what *its* session is doing. Never read another session's file.
+    """
+    if not session_id or not _path_safe(session_id):
+        return {}
+    return _read_json(_PHASE_DIR / f"{session_id}.json")
+
+
+def _plural(n: int, word: str) -> str:
+    if n == 1:
+        return f"{n} {word}"
+    plural = word[:-1] + "ies" if word.endswith("y") else word + "s"
+    return f"{n} {plural}"
+
+
+def _active_label(active: dict) -> str:
+    phase = str(active.get("phase") or "")
+    label = _ACTIVE_LABELS.get(phase, "")
+    detail = str(active.get("detail") or "").strip()
+    if phase == "setting_up":
+        return f"{label} · {detail}…" if detail else f"{label}…"
+    return label
+
+
+def _result_label(kind: str, entry: dict) -> str:
+    """What an operation did, at rest: a number only for recall (what helped
+    this turn), a ticked verb for everything that keeps work (a count of
+    captured entries is bookkeeping nobody can act on)."""
+    ok = entry.get("ok", True) is not False
+    count = entry.get("count")
+    try:
+        count = int(count) if count is not None else None
+    except (TypeError, ValueError):
+        count = None
+    if kind == "recalled":
+        if not ok:
+            return "recall failed"
+        if not count:
+            return "nothing relevant"
+        return f"{_plural(count, 'memory')} used"
+    if kind == "saved":
+        if ok or count:
+            return "✓ memory saved"
+        # Nothing landed this turn: spooled for replay, or dropped for good.
+        return "save queued" if entry.get("buffered") is True else "save failed"
+    if kind == "ready":
+        return "memory ready" if ok else "memory unavailable"
+    if kind == "consolidated":
+        return "✓ learned" if ok else "learning failed"
+    if kind == "indexed":
+        return "✓ repository indexed" if ok else "indexing failed"
+    if kind == "anchored":
+        return "✓ context kept" if ok else "context not kept"
+    if kind == "synced":
+        return "✓ session saved" if ok else "session sync failed"
+    return ""
+
+
+def _activity(session_id: str) -> dict:
+    """What to show: ``{"kind": "active"|"result", "text": ..., "age": s}`` or {}.
+
+    An active phase wins; otherwise the most recent result. A stale active phase
+    (a hook that died) is ignored rather than shown forever.
+    """
+    marker = _phase_marker(session_id)
+    if not marker:
+        return {}
+    now = time.time()
+    active = marker.get("active")
+    if isinstance(active, dict) and active.get("phase"):
+        try:
+            age = now - float(active.get("updated_at") or 0)
+        except (TypeError, ValueError):
+            age = _PHASE_STALE_SECONDS
+        if age < _PHASE_STALE_SECONDS:
+            text = _active_label(active)
+            if text:
+                return {
+                    "kind": "active",
+                    "phase": str(active.get("phase")),
+                    "text": text,
+                    "age": age,
+                }
+    results = marker.get("results")
+    if not isinstance(results, dict):
+        return {}
+    latest_kind, latest, latest_at = "", {}, -1.0
+    for kind, entry in results.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            at = float(entry.get("at") or 0)
+        except (TypeError, ValueError):
+            continue
+        if at > latest_at:
+            latest_kind, latest, latest_at = str(kind), entry, at
+    text = _result_label(latest_kind, latest) if latest_kind else ""
+    if not text:
+        return {}
+    return {
+        "kind": "result",
+        "phase": latest_kind,
+        "text": text,
+        "age": max(0.0, now - latest_at),
+        "ok": latest.get("ok", True) is not False,
+    }
+
+
+def _activity_segment(session_id: str, style: str = "") -> str:
+    """`` · recalling…`` while memory works, `` · 3 memories used`` after.
+
+    Reads the per-session activity marker the hooks write (no network). Active
+    phases render in the accent colour; a finished result renders plain, then
+    faint once it is a minute old, and leaves after five.
+    ``COGNEE_STATUSLINE_ACTIVITY=false`` hides it.
+    """
+    if os.environ.get("COGNEE_STATUSLINE_ACTIVITY", "").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return ""
+    shown = _activity(session_id)
+    if not shown:
+        return ""
+    if shown["kind"] == "active":
+        return f" · {_ACTIVE_STYLE}{shown['text']}{_RESET}"
+    age = shown.get("age", 0.0)
+    if age >= _RESULT_HIDE_AFTER_SECONDS:
+        return ""
+    # ``style`` colours a finished result (the badge line passes its purple);
+    # the classic line passes nothing and keeps its plain text.
+    if age >= _RESULT_DIM_AFTER_SECONDS:
+        return f" {_DIM}· {style}{shown['text']}{_RESET}"
+    return f" · {style}{shown['text']}{_RESET}" if style else f" · {shown['text']}"
+
+
+def _icon() -> str:
+    """An optional brain in front of the name (``COGNEE_STATUSLINE_ICON=brain``).
+
+    Off by default in the terminal: the emoji is double-width and some terminal
+    fonts misrender it, and the green dot already carries "connected".
+    """
+    choice = os.environ.get("COGNEE_STATUSLINE_ICON", "").strip().lower()
+    return "🧠 " if choice == "brain" else ""
+
+
 def _recall_marker(session_id: str) -> dict:
     """This session's recall marker, or {} when nothing attributable exists.
 
@@ -648,10 +848,6 @@ def _int(mapping, key) -> int:
         return int(mapping.get(key, 0) or 0)
     except (TypeError, ValueError):
         return 0
-
-
-def _plural(n: int, word: str) -> str:
-    return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
 def _recall_segment(session_id: str) -> str:
@@ -731,13 +927,14 @@ def _credits_segment() -> str:
     normal weight and carries a ``~``: spend aggregates asynchronously
     server-side, so the delta is an attribution, not an invoice.
     """
-    if os.environ.get("COGNEE_STATUSLINE_CREDITS", "").strip().lower() in (
-        "0",
-        "false",
-        "no",
-        "off",
-    ):
+    choice = os.environ.get("COGNEE_STATUSLINE_CREDITS", "").strip().lower()
+    if choice in ("0", "false", "no", "off"):
         return ""
+    if choice == "exhausted":
+        # A preview of the out-of-credits state, for checking how the segment
+        # and the row's billing link look without an empty balance: never
+        # read from a marker, never written anywhere.
+        return f" · \033[31mcredits: -$0.40\033[0m{_top_up_hint()}"
     if _active_mode() != "cloud":
         return ""
     # The marker is a MAP keyed by tenant id (several terminals can be on
@@ -831,6 +1028,13 @@ def _runtime_python_missing() -> bool:
         return False
 
 
+def _items_segment(session_id: str) -> str:
+    from _session_stats import read as read_stats
+
+    count = read_stats(session_id).get("entries_injected", 0)
+    return f"{count} recalled · " if count else ""
+
+
 def _status_prefix(session_id: str = "") -> str:
     """The single left glyph slot shared by the server- and LLM-key signals.
 
@@ -857,52 +1061,310 @@ def _status_prefix(session_id: str = "") -> str:
     return _llm_prefix(session_id) or server
 
 
+_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _classic_line(session_id: str) -> str:
+    items = (
+        _items_segment(session_id)
+        if _path_safe(session_id) and session_id not in {".", ".."}
+        else ""
+    )
+    return (
+        f"{_status_prefix(session_id)}{items}{_icon()}"
+        f"cognee: {_active_dataset(session_id)} · {_mode_label()}"
+        f"{_credits_segment()}{_recall_segment(session_id)}{_activity_segment(session_id)}"
+        f"{_update_segment()}"
+    )
+
+
+def _light_theme() -> bool:
+    """COGNEE_STATUSLINE_THEME first; else Claude Code's own ``theme`` setting
+    (``light``, ``light-daltonized``). ``auto`` cannot be told apart here."""
+    forced = os.environ.get("COGNEE_STATUSLINE_THEME", "").lower()
+    if forced in ("light", "dark"):
+        return forced == "light"
+    try:
+        settings = json.loads((Path.home() / ".claude" / "settings.json").read_text("utf-8"))
+        return str(settings.get("theme") or "").lower().startswith("light")
+    except Exception:
+        return False
+
+
+def _purple() -> str:
+    return "\033[38;5;93m" if _light_theme() else "\033[38;5;141m"
+
+
+def _unicode_output() -> bool:
+    encoding = str(getattr(sys.stdout, "encoding", "") or "").lower().replace("-", "")
+    return encoding in {"utf8", "utf_8"}
+
+
+def _clean_label(value: str) -> str:
+    return "".join(
+        c if not unicodedata.category(c).startswith("C") else " " for c in _ANSI.sub("", value)
+    )
+
+
+def _ascii_line(value: str) -> str:
+    replacements = {
+        "■": "#",
+        "●": "#",
+        "○": "o",
+        "✕": "[x]",
+        "·": "|",
+        "⬆": "^",
+        "…": "...",
+        "▰": "#",
+        "▱": "-",
+        "▔": "-",
+        "▀": "#",
+        "▄": "#",
+    }
+    for char in "▁▂▃▄▅▆▇█":
+        replacements[char] = "#"
+    return "".join(replacements.get(c, c if ord(c) < 128 else "?") for c in value)
+
+
+def _width(value: str) -> int:
+    return sum(
+        0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in {"W", "F"} else 1
+        for c in _ANSI.sub("", value)
+    )
+
+
+def _columns() -> int | None:
+    """The terminal width when the host reports one; None means do not fit."""
+    try:
+        return max(1, int(os.environ["COLUMNS"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _clip(value: str, width: int) -> str:
+    """Last resort for tiny terminals; keep ANSI sequences intact and reset colour."""
+    output, used, offset = [], 0, 0
+    while offset < len(value):
+        ansi = _ANSI.match(value, offset)
+        if ansi:
+            output.append(ansi.group())
+            offset = ansi.end()
+            continue
+        char = value[offset]
+        size = _width(char)
+        if used + size > width:
+            break
+        output.append(char)
+        used += size
+        offset += 1
+    return "".join(output) + _RESET
+
+
+def _tokens_saved(stats: dict, *, compact: bool = False) -> str:
+    if _int(stats, "recalls") <= 0 or "chars_injected" not in stats:
+        return "saved n/a" if compact else "tokens saved n/a"
+    # Average context tokens per recall * recall count * 6.9 simplifies to
+    # total context tokens * 6.9. Estimate tokens at four characters each;
+    # multiply before rounding so small recalls retain their contribution.
+    tokens = max(0, _int(stats, "chars_injected")) * 69 // 40
+    if tokens >= 1_000_000:
+        amount = f"{tokens // 100_000 / 10:g}m"
+    elif tokens >= 1000:
+        amount = f"{tokens // 100 / 10:g}k"
+    else:
+        amount = str(tokens)
+    return f"~{amount}t saved" if compact else f"~{amount} tokens saved"
+
+
+def _tetris_line(session_id: str, *, now: float | None = None) -> str:
+    del now  # kept for callers; the line no longer animates
+    purple = _purple()
+    unicode = _unicode_output()
+    columns = _columns()
+    # The same row the mod draws above the prompt, so the two never look like
+    # different things: the connection glyph (a green ● once the server is
+    # confirmed up and authenticated, a dim ○ while nothing is known yet, the
+    # red ✕ and its reason on a failure), the wordmark in the brand purple, the
+    # dataset plain, the mode in purple.
+    health = _status_prefix(session_id)
+    if "●" in health:
+        lead, health = f"{_OK_STYLE}●{_RESET} ", ""
+    elif health:
+        lead, health = health.rstrip() + " ", ""
+    else:
+        lead = f"{_DIM}○{_RESET} "
+    dataset = _clean_label(_active_dataset(session_id))
+    badge = f"{lead}{purple}\033[1mcognee{_RESET}"
+    brand = f"{badge} {dataset} · {purple}\033[1m{_active_mode()}{_RESET}"
+    stats = (
+        _read_json(_SESSIONS_DIR / session_id / "stats.json")
+        if _path_safe(session_id) and session_id not in {".", ".."}
+        else {}
+    )
+    core = health + brand
+    # No counters: the activity segment says what the last recall did, and the
+    # estimate below says what memory has saved. (The classic line keeps its own.)
+    credits, update = _credits_segment(), _update_segment()
+    # The estimate and, after it, what memory is doing right now, both in the
+    # brand purple at rest (an active phase keeps its accent colour).
+    emphasis = f"{purple}\033[1m"
+    activity = _activity_segment(session_id, style=emphasis)
+    savings = f" · {emphasis}{_tokens_saved(stats)}{_RESET}" + activity
+    short_savings = f" · {emphasis}{_tokens_saved(stats, compact=True)}{_RESET}" + activity
+    # No reported width (the normal Claude Code case) shows the full line.
+    wide = columns is None or columns > 60
+    # Keep the badge at every width: shorten the token units, then compact the
+    # spacing, before dropping the estimate.
+    candidates = [
+        core + savings + credits + update,
+        core + short_savings + credits + update,
+        core.replace(" · ", "·") + short_savings + credits + update,
+    ]
+    # A credit warning or update notice is never dropped to save width: they are
+    # the segments a user has to act on.
+    if not credits and not update:
+        candidates += [core + savings, core + short_savings, core, core.replace(" · ", "·")]
+    else:
+        candidates += [
+            core.replace(" · ", "·") + credits + update,
+            badge + " " + (credits + update).lstrip(" ·"),
+            # Narrowest form with a notice: health plus the notices alone.
+            health + (credits + update).lstrip(" ·"),
+        ]
+    if wide:
+        # Prefer breathing room, then compact spacing before dropping data.
+        candidates = [
+            variant
+            for candidate in candidates
+            for variant in (candidate.replace(" · ", "  ·  "), candidate)
+        ]
+    if not unicode:
+        candidates = [_ascii_line(candidate) for candidate in candidates]
+    # Claude Code does not normally export COLUMNS to the status line command;
+    # without a real width, show the full line as classic does.
+    if columns is None:
+        return candidates[0]
+    for candidate in candidates:
+        if _width(candidate) <= columns:
+            return candidate
+    # Long dataset/reason or a very small terminal: preserve a single safe line.
+    return _clip(candidates[-1], columns)
+
+
+def _plain(text: str) -> str:
+    return _ANSI.sub("", text)
+
+
+def _snapshot(session_id: str, enabled: bool) -> dict:
+    """The bar as structured data (``--json``), for the Claude Code mod.
+
+    The mod draws the same row on the desktop band, where the settings-file
+    status line does not render, so one renderer feeds both surfaces and the two
+    never drift. Same inputs as the text bar, no network, no eviction.
+    """
+    prefix = _plain(_status_prefix(session_id)).strip()
+    if "✕" in prefix:
+        state, reason = "fail", prefix[prefix.find("(") + 1 : prefix.rfind(")")]
+    elif "●" in prefix:
+        state, reason = "ok", ""
+    else:
+        state, reason = "", ""
+    activity = _activity(session_id)
+    counts = _counts(session_id)
+    raw_credits = _credits_segment()
+    credits = _plain(raw_credits).strip(" ·")
+    # The text line paints the balance green, or red once exhausted or refused;
+    # the row above the prompt reads the verdict here rather than the colour.
+    credits_exhausted = "\033[31m" in raw_credits
+    # The way out, as a link the row above the prompt can draw: present only
+    # while the text line shows its top-up hint.
+    billing_url = _billing_url() if "top up: " in credits else ""
+    update = _plain(_update_segment()).strip(" ·")
+    dataset = _active_dataset(session_id)
+    mode = _active_mode()
+    line = f"cognee: {dataset} · {mode}"
+    for segment in (credits, activity.get("text", ""), update):
+        if segment:
+            line += f" · {segment}"
+    return {
+        "enabled": enabled,
+        "state": state,
+        "reason": reason,
+        "dataset": dataset,
+        "mode": mode,
+        "credits": credits,
+        "credits_exhausted": credits_exhausted,
+        "billing_url": billing_url,
+        "activity": activity,
+        "counts": counts,
+        "update": update,
+        "text": line,
+    }
+
+
+def _counts(session_id: str) -> dict:
+    """The estimated tokens saved as data, for the row the hooks module draws.
+    Same source as ``_tetris_line``."""
+    safe = _path_safe(session_id) and session_id not in {".", ".."}
+    stats = _read_json(_SESSIONS_DIR / session_id / "stats.json") if safe else {}
+    return {
+        "tokens_saved": _tokens_saved(stats),
+        "tokens_saved_short": _tokens_saved(stats, compact=True),
+    }
+
+
 def main() -> None:
-    # Windows defaults stdio to the locale code page (e.g. cp1252), which cannot
-    # encode the status glyphs (●, ✕, ⬆) — the write raises UnicodeEncodeError,
-    # the renderer exits non-zero, and Claude Code drops the whole status line
-    # (cp1252 also fails to decode a non-ASCII cwd from the JSON context). Force
-    # UTF-8 on both streams: the context is UTF-8 and our output is UTF-8. Runtime
-    # reconfigure overrides the inherited encoding; best-effort, since a stream
-    # that can't be reconfigured (e.g. a captured stdout under test) is left as-is,
-    # matching this renderer's never-raise design.
-    for _stream in (sys.stdin, sys.stdout):
+    as_json = "--json" in sys.argv[1:]
+    classic = os.environ.get("COGNEE_STATUSLINE_STYLE", "").strip().lower() == "classic"
+    # UTF-8 in both styles, as before 1.6.22 (Windows pipes default to cp1252,
+    # which cannot encode the status glyphs). The default style falls back to
+    # ASCII only if stdout cannot be switched.
+    for stream in (sys.stdin, sys.stdout):
         try:
-            _stream.reconfigure(encoding="utf-8")
+            stream.reconfigure(encoding="utf-8")
         except Exception:
             pass
-
-    ctx = {}
     try:
-        ctx = json.load(sys.stdin)  # consume stdin as required by Claude Code
+        ctx = json.load(sys.stdin)
     except Exception:
         ctx = {}
     if not isinstance(ctx, dict):
         ctx = {}
-
-    cwd = str(
-        ctx.get("cwd")
-        or (ctx.get("workspace") or {}).get("current_dir")
-        or (ctx.get("workspace") or {}).get("project_dir")
-        or ""
-    )
-    if not _plugin_enabled(cwd):
-        # Plugin uninstalled/disabled but files linger: drop our own statusLine
-        # entry and render nothing so the line disappears.
-        _evict_own_statusline()
-        return
-
+    workspace = ctx.get("workspace") if isinstance(ctx.get("workspace"), dict) else {}
+    cwd = str(ctx.get("cwd") or workspace.get("current_dir") or workspace.get("project_dir") or "")
     # Host session id: markers are per-integration, not per-session, so both the
-    # LLM-key verdict and the recall counts are attributed before being shown.
-    _session_id = str(ctx.get("session_id") or "")
-    # The recall counts belong to the cognee core info, so they sit right after the
-    # mode; the update nudge stays last because it is a transient banner, not part
-    # of the steady-state line.
-    sys.stdout.write(
-        f"{_status_prefix(_session_id)}"
-        f"cognee: {_active_dataset(_session_id)} · {_mode_label()}"
-        f"{_credits_segment()}{_recall_segment(_session_id)}{_update_segment()}"
-    )
+    # LLM-key verdict and the activity are attributed before being shown.
+    session_id = str(ctx.get("session_id") or "")
+    if not _path_safe(session_id) or session_id in {".", ".."}:
+        session_id = ""
+    try:
+        if not _plugin_enabled(cwd):
+            if as_json:
+                # The mod asks on behalf of a session that IS running the plugin;
+                # report rather than evict (the settings entry is the bar's, not ours).
+                sys.stdout.write(json.dumps(_snapshot(session_id, enabled=False)))
+                return
+            # Plugin uninstalled/disabled but files linger: drop our own statusLine
+            # entry and render nothing so the line disappears.
+            _evict_own_statusline()
+            return
+        if as_json:
+            sys.stdout.write(json.dumps(_snapshot(session_id, enabled=True)))
+            return
+        if _band_draws_row(session_id):
+            # The hooks module draws this session's row above the prompt: stay quiet.
+            return
+        try:
+            line = _classic_line(session_id) if classic else _tetris_line(session_id)
+        except Exception:
+            line = _classic_line(session_id)
+        line = line.replace("\n", " ").replace("\r", " ")
+        if not classic and not _unicode_output():
+            line = _ascii_line(line)
+        sys.stdout.write(line)
+    except Exception:
+        # Status must never interrupt the host, including partially written markers.
+        return
 
 
 if __name__ == "__main__":

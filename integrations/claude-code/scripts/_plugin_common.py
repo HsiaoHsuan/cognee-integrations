@@ -52,13 +52,16 @@ _COUNTER_FILE = _PLUGIN_DIR / "counter.json"
 _ACTIVITY_FILE = _PLUGIN_DIR / "activity.ts"
 _ACTIVITY_LOG = _PLUGIN_DIR / "activity.log"
 _SAVE_COUNTER = _PLUGIN_DIR / "save_counter.json"
+#: Whether credit tags and the resume notice are on when
+#: ``COGNEE_PLUGIN_CITE_MEMORY`` is unset (SDK-1071).
+CITE_MEMORY_DEFAULT = True
 _SERVER_READY_MARKER = _SHARED_PLUGIN_ROOT / "server-ready.json"
 _SERVER_READY_TTL_SECONDS = 30
 # One state file per session (see record_improve_success / record_improve_failure):
 # when the last improve attempt ran, whether it landed, and how many turns the
-# session had at the last success. Every improve trigger records it; the idle
-# and auto triggers consult it so the cooldown (and the failure backoff) survive
-# the watcher's exit-after-bridge respawn cycle.
+# session had at the last success. Every improve trigger records it; the auto
+# trigger consults it so the cooldown (and the failure backoff) survive across
+# hook processes.
 _IMPROVE_STATE_DIR = _PLUGIN_DIR / "improve-state"
 # Per-agent-session buffer dirs. Each agent session (one Claude/Codex terminal)
 # owns its own file under these dirs, so two concurrent agents never
@@ -869,8 +872,32 @@ def list_writable_datasets(user_id: str = "", *, timeout: float = 15.0) -> dict:
     """
     items = list_readable_datasets(timeout=timeout)
     if not user_id:
-        me = _json_http_request("/api/v1/users/me", method="GET", timeout=timeout)
-        user_id = str(me.get("id") or "") if isinstance(me, dict) else ""
+        # The key's own user, from the data plane: the connection lookup serves
+        # it with or without a session name (the key identifies the user), on
+        # cloud tenants and OSS servers alike; session start reads it there too.
+        try:
+            conn = _json_http_request(
+                "/api/v1/agents/connections/me", method="GET", timeout=timeout
+            )
+            agent = conn.get("agent") if isinstance(conn, dict) else None
+            user_id = str(agent.get("user_id") or "").strip() if isinstance(agent, dict) else ""
+        except urllib.error.HTTPError as exc:
+            hook_log(
+                "runtime_state_connection_lookup_failed",
+                {"status": exc.code, "where": "list_datasets"},
+            )
+    if not user_id and not _platform_host_for(_local_api_url()):
+        # /users/me is the identity route of an OSS server, where no connection
+        # may exist yet. A cloud tenant host has none: that route lives on the
+        # platform API (api.<env>), where it answers account settings without
+        # an id, so a tenant is not asked. Without an id the write check is
+        # skipped and every readable dataset is offered, ``writable`` unknown,
+        # rather than no listing at all.
+        try:
+            me = _json_http_request("/api/v1/users/me", method="GET", timeout=timeout)
+            user_id = str(me.get("id") or "") if isinstance(me, dict) else ""
+        except urllib.error.HTTPError as exc:
+            hook_log("users_me_lookup_failed", {"status": exc.code, "where": "list_datasets"})
     writable_ids = None
     if user_id:
         try:
@@ -907,6 +934,7 @@ def list_writable_datasets(user_id: str = "", *, timeout: float = 15.0) -> dict:
             writable = True if owner and (owner == user_id or via_role) else None
         rows.append({**item, "writable": writable})
     return {
+        "user_id": user_id,
         "datasets": [row for row in rows if row["writable"] is not False],
         "readonly": [row["name"] for row in rows if row["writable"] is False],
         "readonly_ids": [row["id"] for row in rows if row["writable"] is False],
@@ -1176,7 +1204,7 @@ def load_resolved(session_key: str = "", *, identity: bool = True) -> dict:
         conn = _json_http_request(
             f"/api/v1/agents/connections/me{query}",
             method="GET",
-            timeout=10.0,
+            timeout=15.0,
         )
         if isinstance(conn, dict):
             agent = conn.get("agent") if isinstance(conn.get("agent"), dict) else {}
@@ -1201,9 +1229,26 @@ def load_resolved(session_key: str = "", *, identity: bool = True) -> dict:
     except Exception as exc:
         hook_log("runtime_state_connection_lookup_failed", {"error": str(exc)[:200]})
 
-    # Fallback identity probe — only when the connection lookup yielded none
-    # (e.g. before registration on a fresh launch).
-    if not resolved.get("user_id"):
+    # The connection named above may not exist yet (a fresh launch, a tenant
+    # the session was not registered on). The key's own user is the same on
+    # every connection of the key, so any connection of it answers.
+    if conn_uuid and not resolved.get("user_id"):
+        try:
+            conn = _json_http_request("/api/v1/agents/connections/me", method="GET", timeout=10.0)
+            agent = conn.get("agent") if isinstance(conn, dict) else None
+            user_id = str(agent.get("user_id") or "").strip() if isinstance(agent, dict) else ""
+            if user_id:
+                resolved["user_id"] = user_id
+        except Exception as exc:
+            hook_log(
+                "runtime_state_connection_lookup_failed",
+                {"error": str(exc)[:200], "where": "any_connection"},
+            )
+
+    # Fallback identity probe — only when no connection answered, and never on
+    # a cloud tenant host, which has no /users/me (the platform API's copy
+    # answers account settings without an id).
+    if not resolved.get("user_id") and not _platform_host_for(service_url):
         try:
             me = _json_http_request("/api/v1/users/me", method="GET", timeout=10.0)
             if isinstance(me, dict):
@@ -1569,6 +1614,10 @@ def bump_save_counter(session_id: str, kind: str, *, buffered: bool = False) -> 
         kind = f"{kind}_buffered"
     if not session_id or kind not in ALL_SAVE_KINDS:
         return
+    if not buffered:
+        from _session_stats import update as update_stats
+
+        update_stats(get_session_key(), saves=1, metadata={"session_id": session_id})
     try:
         data = (
             json.loads(_SAVE_COUNTER.read_text(encoding="utf-8")) if _SAVE_COUNTER.exists() else {}
@@ -1584,6 +1633,68 @@ def bump_save_counter(session_id: str, kind: str, *, buffered: bool = False) -> 
         _SAVE_COUNTER.write_text(json.dumps(data), encoding="utf-8")
     except Exception as exc:
         hook_log("save_counter_write_failed", {"path": str(_SAVE_COUNTER), "error": str(exc)[:200]})
+    _bump_stored_seq(get_session_key() or session_id)
+
+
+def _stored_seq_path(session_key: str):
+    """``stored.log`` in the session's state folder (see ``read_stored_seq``)."""
+    from _recall_text import session_state_dir
+
+    folder = session_state_dir(_PLUGIN_DIR, session_key)
+    return folder / "stored.log" if folder else None
+
+
+def _bump_stored_seq(session_key: str) -> None:
+    """Advance the session's running stored-item count by one.
+
+    Appends one byte instead of rewriting a count: an append this small is
+    atomic, so parallel store hooks need no lock, nothing is read back, and
+    the count can only grow. One file per session, so no session can wipe
+    another's.
+    """
+    path = _stored_seq_path(session_key)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            # Windows emulates O_APPEND as a seek then a write, two steps that
+            # interleave across handles, so parallel hooks lost bytes there.
+            from _file_lock import file_lock
+
+            with file_lock(path.with_suffix(".lock"), timeout=5.0) as acquired:
+                if not acquired:
+                    raise OSError("stored.log lock busy")
+                _append_one_byte(path)
+        else:
+            _append_one_byte(path)
+    except OSError as exc:
+        hook_log("stored_seq_write_failed", {"error": str(exc)[:200]})
+
+
+def _append_one_byte(path) -> None:
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        os.write(fd, b".")
+    finally:
+        os.close(fd)
+
+
+def read_stored_seq(session_key: str) -> int:
+    """How many items this session has stored so far, buffered ones included.
+
+    Unlike the save counter it is never reset, so a later value means the
+    session stored something new. The session-end sync keys its dedupe marker
+    on it: the two workers of one exit share a value, a later exit after new
+    turns does not.
+    """
+    path = _stored_seq_path(session_key)
+    if path is None:
+        return 0
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
 
 
 def read_and_reset_save_counter(session_id: str) -> dict:
@@ -1657,6 +1768,14 @@ def warmup_backlog() -> dict:
                 age = max(0.0, now - buffered_at)
                 if oldest is None or age > oldest:
                     oldest = age
+    for path in (_PLUGIN_DIR / "spool").glob("*.json"):
+        try:
+            item = json.loads(path.read_text(encoding="utf-8"))
+            result["pending"] += 1
+            age = max(0, now - float(item.get("created_at", path.stat().st_mtime)))
+            oldest = max(oldest or 0, age)
+        except (OSError, ValueError, TypeError):
+            continue
     result["oldest_age_seconds"] = oldest
     return result
 
@@ -1865,11 +1984,11 @@ def read_turn_count(session_id: str) -> int:
         return 0
 
 
-IMPROVE_COOLDOWN_DEFAULT_SECONDS = 5400.0
+IMPROVE_COOLDOWN_DEFAULT_SECONDS = 24 * 60 * 60.0
 
 
 def improve_cooldown_seconds() -> float:
-    """Minimum seconds between idle/auto improves of one session (COGNEE_IMPROVE_COOLDOWN)."""
+    """Minimum seconds between auto improves of one session (COGNEE_IMPROVE_COOLDOWN)."""
     raw = os.environ.get("COGNEE_IMPROVE_COOLDOWN", "").strip()
     try:
         value = float(raw) if raw else IMPROVE_COOLDOWN_DEFAULT_SECONDS
@@ -1891,14 +2010,18 @@ def read_improve_state(session_id: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def record_improve_success(session_id: str, dataset: str, trigger: str) -> None:
+def record_improve_success(
+    session_id: str, dataset: str, trigger: str, turn_count: int | None = None
+) -> None:
     """Persist that an improve of ``session_id`` just landed.
 
     Called by ``run_session_improve_detailed`` itself on a confirmed 2xx submit,
     never by its callers, so a skipped or failed attempt can never be stamped as
     a success. Replaces the whole state, which also clears any failure backoff.
-    The idle/auto triggers read this back through ``improve_throttle_reason``.
+    The auto trigger reads this back through ``improve_throttle_reason``.
     Best-effort: a write failure is logged and never fails the improve.
+    ``turn_count`` is the count when the improve was submitted, when known:
+    entries stored while it ran are then still new for the next one.
     """
     if not session_id:
         return
@@ -1909,7 +2032,9 @@ def record_improve_success(session_id: str, dataset: str, trigger: str) -> None:
                 "session_id": session_id,
                 "dataset": dataset,
                 "last_improved_at": time.time(),
-                "turn_count_at_improve": read_turn_count(session_id),
+                "turn_count_at_improve": (
+                    read_turn_count(session_id) if turn_count is None else turn_count
+                ),
                 "trigger": trigger,
             },
         )
@@ -1946,15 +2071,15 @@ def record_improve_failure(session_id: str, dataset: str, trigger: str, reason: 
 
 
 def improve_throttle_reason(session_id: str) -> str:
-    """Why an idle/auto improve of ``session_id`` should be skipped right now.
+    """Why an auto improve of ``session_id`` should be skipped right now.
 
     ``"cooldown"`` while the last successful improve is younger than
     ``improve_cooldown_seconds()``; ``"backoff"`` while the last FAILED attempt
     (busy, timeout, unreachable...) is; ``"no_new_entries"`` when nothing was
     stored since the last success; ``""`` when an improve may run. A session that
-    never attempted an improve is never throttled. Only the automatic triggers
-    (idle watcher, every-N entries) honour this — the session-end, manual and
-    dataset-switch syncs always run.
+    never attempted an improve is never throttled. Only the automatic every-N
+    entries trigger honours this — the session-end, manual and dataset-switch
+    syncs always run.
     """
     state = read_improve_state(session_id)
     if not state:
@@ -1987,6 +2112,153 @@ def touch_activity() -> None:
         _ACTIVITY_FILE.write_text(str(datetime.now(timezone.utc).timestamp()), encoding="utf-8")
     except Exception as exc:
         hook_log("activity_touch_failed", {"path": str(_ACTIVITY_FILE), "error": str(exc)[:200]})
+
+
+# ── Live activity marker ─────────────────────────────────────────────────────
+# What memory is doing right now, and the last thing it finished, for the status
+# surfaces (the terminal status line and the Claude Code mod's desktop band)
+# to show without any network call. One file per host session under
+# ``phase/<session_key>.json``; machine-wide work (the idle watcher, the detached
+# final sync) writes under its own session key too, so every bar attributes what
+# it shows.
+#
+# Shape::
+#
+#     {"session_key": "...",
+#      "active": {"phase": "recalling", "detail": "", "started_at": t, "updated_at": t},
+#      "results": {"recalled": {"count": 3, "at": t}, "saved": {"count": 5, "at": t}},
+#      "saved_this_turn": 5}
+#
+# ``active`` is null between operations. ``results`` keeps the latest outcome of
+# each kind; the renderer shows the most recent one. The saved count accumulates
+# per turn (every trace entry and the QA pair) and resets when the next recall
+# begins, so "saved 5 memories" means this turn.
+#
+# Phases overlap (a tool-call save lands while the next prompt's recall runs):
+# a begin never displaces a fresher, higher-priority phase, and an end only
+# clears the phase it began. Best-effort throughout — the marker must never
+# break a hook.
+_PHASE_DIR = _PLUGIN_DIR / "phase"
+_PHASE_STALE_SECONDS = 90.0
+# Lower number wins the single ``active`` slot while both are fresh.
+_PHASE_PRIORITY = {
+    "setting_up": 0,
+    "connecting": 1,
+    "recalling": 2,
+    "anchoring": 3,
+    "syncing": 4,
+    "saving": 5,
+    "indexing": 6,
+    "consolidating": 7,
+}
+_PHASE_RESULT_KIND = {
+    "setting_up": "ready",
+    "connecting": "ready",
+    "recalling": "recalled",
+    "anchoring": "anchored",
+    "syncing": "synced",
+    "saving": "saved",
+    "indexing": "indexed",
+    "consolidating": "consolidated",
+}
+
+
+def _phase_key(session_key: Optional[str]) -> str:
+    key = str(session_key or get_session_key() or "").strip()
+    if not key:
+        key = "_machine"
+    # The key comes from a hook payload; never build a path from it unchecked.
+    return "".join(ch if (ch.isalnum() or ch in "._-") else "_" for ch in key)[:200]
+
+
+def _phase_path(session_key: Optional[str]) -> Path:
+    return _PHASE_DIR / f"{_phase_key(session_key)}.json"
+
+
+def _read_phase(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def phase_begin(phase: str, detail: str = "", session_key: Optional[str] = None) -> None:
+    """Record that ``phase`` (recalling, saving, consolidating, ...) is running."""
+    try:
+        path = _phase_path(session_key)
+        state = _read_phase(path)
+        now = time.time()
+        current = state.get("active") if isinstance(state.get("active"), dict) else None
+        if current:
+            fresh = now - float(current.get("updated_at") or 0) < _PHASE_STALE_SECONDS
+            keeps_slot = _PHASE_PRIORITY.get(str(current.get("phase")), 99) < _PHASE_PRIORITY.get(
+                phase, 99
+            )
+            if fresh and keeps_slot and current.get("phase") != phase:
+                # A more important phase owns the slot; leave it. Our own end
+                # still records its result below.
+                return
+        state["session_key"] = _phase_key(session_key)
+        state["active"] = {
+            "phase": phase,
+            "detail": str(detail or "")[:120],
+            "started_at": now,
+            "updated_at": now,
+        }
+        if phase == "recalling":
+            # A new turn: the per-turn save counter starts over.
+            state["saved_this_turn"] = 0
+        _write_json_file(path, state)
+    except Exception as exc:
+        hook_log("phase_begin_failed", {"phase": phase, "error": str(exc)[:200]})
+
+
+def phase_end(
+    phase: str,
+    count: Optional[int] = None,
+    session_key: Optional[str] = None,
+    ok: bool = True,
+    buffered: bool = False,
+) -> None:
+    """Record that ``phase`` finished; ``count`` is what it recalled or saved.
+
+    ``ok`` False marks failed work (the row says so); ``buffered`` True with it
+    says the write was spooled for replay rather than lost.
+    """
+    try:
+        path = _phase_path(session_key)
+        state = _read_phase(path)
+        now = time.time()
+        state["session_key"] = _phase_key(session_key)
+        current = state.get("active") if isinstance(state.get("active"), dict) else None
+        if current and current.get("phase") == phase:
+            state["active"] = None
+        results = state.get("results") if isinstance(state.get("results"), dict) else {}
+        kind = _PHASE_RESULT_KIND.get(phase, phase)
+        entry: dict = {"at": now, "ok": bool(ok)}
+        if buffered:
+            entry["buffered"] = True
+        if phase == "saving":
+            total = int(state.get("saved_this_turn") or 0) + int(count or 0)
+            state["saved_this_turn"] = total
+            entry["count"] = total
+        elif count is not None:
+            entry["count"] = int(count)
+        results[kind] = entry
+        state["results"] = results
+        _write_json_file(path, state)
+    except Exception as exc:
+        hook_log("phase_end_failed", {"phase": phase, "error": str(exc)[:200]})
+
+
+def phase_snapshot(session_key: Optional[str] = None) -> dict:
+    """The marker as the status surfaces read it (stale ``active`` cleared)."""
+    state = _read_phase(_phase_path(session_key))
+    current = state.get("active") if isinstance(state.get("active"), dict) else None
+    if current and time.time() - float(current.get("updated_at") or 0) >= _PHASE_STALE_SECONDS:
+        state["active"] = None
+    return state
 
 
 def _local_api_url_with_source() -> tuple[str, str]:
@@ -3176,12 +3448,10 @@ def server_presence(
 # Connection states recorded in the (shared) server-ready marker. "ready" means
 # the server is up AND authenticated; the failure states carry the reason shown
 # in the status line as "✕ (<state>)". Any non-"ready" state makes
-# server_ready_hint return False so recall does not attempt against a bad backend.
+# server_ready_hint return False.
 # "unreachable" is reserved for POSITIVE absence (connection refused / DNS /
-# unroutable). "not_responding" is deliberately distinct: the server exists
-# (connections are not refused) but has not answered within budget for N
-# consecutive prompts — written only by the slow-streak escalation (see
-# record_slow_probe), never by a lone timeout.
+# unroutable). "not_responding" remains readable for compatibility with older
+# state files. Timeout streaks no longer write it or prevent another recall.
 CONNECTION_STATES = ("ready", "auth_failed", "unreachable", "server_error", "not_responding")
 
 
@@ -3270,17 +3540,13 @@ def mark_server_ready(service_url: str, version: str = "") -> None:
     write_connection_state("ready", service_url, version=version)
 
 
-# Slow-server hysteresis. A single timeout is "no verdict" and must not touch
-# the connection marker — but N consecutive timeout-only prompts with no
-# success in between are a pattern (wedged server, packet-dropping network),
-# not a blip. This counter, keyed by base_url, is how a lone blip stays
-# invisible while a persistent stall still escalates to a visible "slow" state
-# (and recall backoff) instead of leaving the bar green forever.
+# Slow-server diagnostics, keyed by base_url. Even a repeated timeout is no
+# outage verdict: the counter produces telemetry without gating future recalls.
 _SLOW_STREAK_FILE = _PLUGIN_DIR / "slow-streak.json"
 
 
 def slow_streak_threshold() -> int:
-    """Consecutive timeout-only prompts before escalating to state "slow"."""
+    """Consecutive timeout-only prompts before logging a slow-streak event."""
     try:
         return max(1, int(os.environ.get("COGNEE_SLOW_STREAK_THRESHOLD", "3") or 3))
     except (TypeError, ValueError):
@@ -3317,9 +3583,8 @@ def record_slow_probe(service_url: str) -> int:
     """Count a consecutive no-verdict (timeout) observation; return the streak.
 
     The streak resets itself when the previous tick is older than the window —
-    two timeouts hours apart are noise, not a pattern. The caller escalates to
-    ``write_connection_state("not_responding", ...)`` once the return value
-    reaches ``slow_streak_threshold()``.
+    two timeouts hours apart are noise, not a pattern. The caller logs diagnostics
+    at ``slow_streak_threshold()`` without changing connection health.
     """
     url = _normalize_service_url(service_url)
     now = datetime.now(timezone.utc).timestamp()
@@ -3333,9 +3598,52 @@ def record_slow_probe(service_url: str) -> int:
     if now - last_at > _slow_streak_window_seconds():
         count = 0
     count += 1
-    state[url] = {"count": count, "last_at": now}
+    state[url] = {**entry, "count": count, "last_at": now}
     _write_slow_streaks(state)
     return count
+
+
+def recall_slow_until(service_url: str) -> float:
+    """When the shortened per-prompt recall budget ends (0 when it never applied).
+
+    A value in the past means recall was slow before: the next full-budget
+    timeout re-arms the short budget at once instead of after a new streak.
+    """
+    entry = _read_slow_streaks().get(_normalize_service_url(service_url))
+    try:
+        return float(entry.get("slow_until") or 0) if isinstance(entry, dict) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+_SLOW_RECALL_MAX_WINDOW_SECONDS = 3600.0
+
+
+def mark_recall_slow(service_url: str) -> float:
+    """Shorten per-prompt recall for a while after repeated timeouts.
+
+    ``clear_slow_streak`` (any recall that answers) ends it early. When the window
+    passes, one prompt runs with the full budget to re-test the server; each
+    re-test that times out again doubles the window (the streak window first,
+    capped at an hour), so a long hang costs a full wait about once an hour.
+    The re-test keeps the full budget on purpose: a server that is slow but
+    working would never pass a re-test under the short budget.
+    """
+    url = _normalize_service_url(service_url)
+    state = _read_slow_streaks()
+    entry = state.get(url) if isinstance(state.get(url), dict) else {}
+    try:
+        strikes = int(entry.get("slow_strikes") or 0) + 1
+    except (TypeError, ValueError):
+        strikes = 1
+    window = min(
+        _slow_streak_window_seconds() * 2 ** min(strikes - 1, 16),
+        max(_SLOW_RECALL_MAX_WINDOW_SECONDS, _slow_streak_window_seconds()),
+    )
+    until = datetime.now(timezone.utc).timestamp() + window
+    state[url] = {**entry, "slow_until": until, "slow_strikes": strikes}
+    _write_slow_streaks(state)
+    return until
 
 
 def clear_slow_streak(service_url: str) -> None:
@@ -3454,21 +3762,24 @@ def capture_policy_notice() -> str:
     return f"Cognee: automatic capture is off until this is fixed: {error}"
 
 
-def with_base_url_notice(output: dict | None, hook_event: str) -> dict | None:
+def with_base_url_notice(
+    output: dict | None, hook_event: str, *, notice: str | None = None
+) -> dict | None:
     """Add the session's notices to a hook's output (user- and model-visible).
 
     Covers ``base_url_change_notice`` and ``capture_policy_notice``.
     """
-    notices = []
-    for source in (base_url_change_notice, capture_policy_notice):
-        try:
-            text = source()
-        except Exception as exc:
-            hook_log("hook_notice_failed", {"source": source.__name__, "error": str(exc)[:200]})
-            continue
-        if text:
-            notices.append(text)
-    notice = "\n".join(notices)
+    if notice is None:
+        notices = []
+        for source in (base_url_change_notice, capture_policy_notice):
+            try:
+                text = source()
+            except Exception as exc:
+                hook_log("hook_notice_failed", {"source": source.__name__, "error": str(exc)[:200]})
+                continue
+            if text:
+                notices.append(text)
+        notice = "\n".join(notices)
     if not notice:
         return output
     result = dict(output or {})
@@ -3745,6 +4056,10 @@ def server_usable(service_url: str = "", probe_timeout: float = 1.0) -> bool:
     hooks keep the marker fresh for the whole turn and the buffer only fills
     when the server is actually unreachable.
     """
+    from _cloud_worker import enabled as cloud_enabled
+
+    if cloud_enabled({"base_url": service_url or _local_api_url()}):
+        return server_ready_hint(service_url)
     if server_ready_hint(service_url):
         return True
     now = datetime.now(timezone.utc).timestamp()
@@ -4661,25 +4976,40 @@ def elapsed_ms(start: float) -> int:
 _TYPED_DATASET_CAPABILITIES = {}
 
 
+def _openapi_request_properties(spec: dict, path: str, method: str = "post") -> set:
+    """The property names of an operation's request body, ``$ref`` resolved."""
+    op = spec.get("paths", {}).get(path, {}).get(method, {})
+    content = op.get("requestBody", {}).get("content", {}) if isinstance(op, dict) else {}
+    names: set = set()
+    for media in content.values():
+        schema = media.get("schema", {}) if isinstance(media, dict) else {}
+        ref = str(schema.get("$ref") or "")
+        if ref.startswith("#/components/schemas/"):
+            schema = spec.get("components", {}).get("schemas", {}).get(ref.rsplit("/", 1)[-1], {})
+        props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+        names |= set(props)
+    return names
+
+
 def require_typed_dataset_id_support(*, service_url: str = "", api_key=None) -> None:
-    """Old SDKs advertise dataset_id but reject typed entries at runtime."""
+    """A write addressed by dataset UUID needs ``POST /api/v1/remember/entry`` to
+    take ``dataset_id``. The server's own API description says whether it does:
+    the request body of that operation lists the field (every server since the
+    V1 routes), and an older one does not. Cached a minute per server."""
     url = _normalize_service_url(service_url or _local_api_url())
     cached = _TYPED_DATASET_CAPABILITIES.get(url)
     supported = cached[1] if cached else False
     if cached is None or time.monotonic() - cached[0] > 60.0:
         spec = _json_http_request("/openapi.json", method="GET", base_url=url, api_key=api_key)
-        supported = (
-            spec.get("paths", {})
-            .get("/api/v1/remember/entry", {})
-            .get("post", {})
-            .get("x-cognee-session-dataset-ids")
-            is True
+        supported = "dataset_id" in _openapi_request_properties(
+            spec if isinstance(spec, dict) else {}, "/api/v1/remember/entry"
         )
         _TYPED_DATASET_CAPABILITIES[url] = (time.monotonic(), supported)
     if not supported:
         raise RuntimeError(
-            "This Cognee server cannot safely store typed session memory by dataset UUID. "
-            "Update the SDK before selecting a shared write dataset."
+            "This Cognee server cannot safely store typed session memory by dataset UUID "
+            "(its POST /api/v1/remember/entry takes no dataset_id). "
+            "Update the server before selecting a shared write dataset."
         )
 
 
@@ -4690,6 +5020,7 @@ def remember_entry_via_http(
     *,
     dataset_id: str | None = None,
     timeout: float = 30.0,
+    client_event_id: str | None = None,
 ) -> dict | None:
     """Store a typed QA/trace entry through the backend API.
 
@@ -4702,10 +5033,25 @@ def remember_entry_via_http(
         return None
     from _project_memory import route
 
+    payload = prepare_remember_entry_payload(dataset, session_id, entry, dataset_id=dataset_id)
+    # Probe the server only for a UUID-shaped write target, as before: hooks are
+    # short-lived processes, so probing every shared-memory write would fetch
+    # /openapi.json on each PostToolUse and Stop.
+    if parse_dataset_id(route(dataset, session_id)["write"]) and not client_event_id:
+        require_typed_dataset_id_support()
+    if client_event_id:
+        payload["client_event_id"] = client_event_id
+    return _json_http_request("/api/v1/remember/entry", payload, timeout=timeout)
+
+
+def prepare_remember_entry_payload(
+    dataset: str, session_id: str, entry: dict, *, dataset_id: str | None = None
+) -> dict:
+    """Resolve the write target locally, so a queued capture can pin its request."""
+    from _project_memory import route
+
     target = route(dataset, session_id)
     dataset = target["write"]
-    if parse_dataset_id(dataset):
-        require_typed_dataset_id_support()
     entry = _sanitize_value(entry)
     if target.get("node_set") and entry.get("type") in ("qa", "trace"):
         entry = {**entry, "node_set": target["node_set"]}
@@ -4714,11 +5060,7 @@ def remember_entry_via_http(
     # Otherwise a UUID-shaped dataset is sent as an id and a name as a name.
     resolved_id = dataset_id if dataset_id is not None else dataset_id_for(dataset)
     fields = {"dataset_id": resolved_id} if resolved_id else write_fields(dataset)
-    return _json_http_request(
-        "/api/v1/remember/entry",
-        {"entry": entry, **fields, "session_id": session_id},
-        timeout=timeout,
-    )
+    return {"entry": entry, **fields, "session_id": session_id}
 
 
 def get_session_detail_via_http(session_id: str, *, timeout: float = 8.0) -> dict | None:
@@ -4970,6 +5312,7 @@ def recall_via_http(
     dataset_ids: list[str] | None = None,
     code_query: dict | None = None,
     timeout: float = 10.0,
+    evidence_mode: str | None = None,
 ) -> list:
     payload = {
         "query": query,
@@ -4978,6 +5321,8 @@ def recall_via_http(
         "scope": scope,
         "only_context": only_context,
     }
+    if evidence_mode:
+        payload["evidence_mode"] = evidence_mode
     # Deterministic code-graph lane (cognee >= 1.5.3). Only meaningful when
     # the scope includes "code": the server rejects code_query without it.
     if code_query:
@@ -5033,7 +5378,8 @@ def recall_via_http(
     def fetch_scopes():
         started = time.monotonic()
         result = _json_http_request("/api/v1/recall", payload, timeout=timeout)
-        result = result if isinstance(result, list) else []
+        if evidence_mode != "index":
+            result = result if isinstance(result, list) else []
         if dataset != write_dataset and "graph" in scope:
             remaining = timeout - (time.monotonic() - started)
             if remaining > 0.05:
@@ -5041,10 +5387,17 @@ def recall_via_http(
                 primary_payload.pop("session_id", None)
                 try:
                     extra = _json_http_request("/api/v1/recall", primary_payload, timeout=remaining)
-                    if isinstance(extra, list):
+                    if isinstance(extra, list) and isinstance(result, list):
                         result.extend(extra)
+                    elif evidence_mode == "index" and isinstance(result, dict):
+                        from _evidence import merge_indexes
+
+                        result = merge_indexes(result, extra)
                 except (OSError, TimeoutError):
-                    pass
+                    if evidence_mode == "index" and isinstance(result, dict):
+                        result["partial"] = True
+            elif evidence_mode == "index" and isinstance(result, dict):
+                result["partial"] = True
         return result
 
     return bounded_call(fetch_scopes, timeout)
@@ -5548,8 +5901,8 @@ def ensure_dataset_via_http(dataset: str) -> None:
 def run_session_improve_detailed(dataset: str, session_id: str, *, trigger: str = "final") -> dict:
     """API-mode session->graph sync: drain warmup entries, then ONE improve submit.
 
-    ``trigger`` names the caller (``idle``, ``auto``, ``final``, ``manual``,
-    ``switch``) and is recorded with the session's improve state. Returns
+    ``trigger`` names the caller (``auto``, ``final``, ``manual``, ``switch``)
+    and is recorded with the session's improve state. Returns
     ``{"ok": bool, "reason": str, "error": str}``: ``ok`` when the improve landed
     and the drain was complete; otherwise ``reason`` is ``busy`` (another improve
     of this session is in flight server-side), ``unreachable`` (backend down,
@@ -5592,7 +5945,7 @@ def run_session_improve_detailed(dataset: str, session_id: str, *, trigger: str 
         result: dict = {"ok": False, "error": "backend unreachable"}
         reason = "unreachable"
     else:
-        # Detached/idle context: nothing user-visible waits on this, so the drain
+        # Detached context: nothing user-visible waits on this, so the drain
         # gets a far larger budget than the per-prompt hook's default.
         final_budget = _float_env("COGNEE_DRAIN_BUDGET_FINAL", 120.0)
         _, remaining = drain_warmup_entries(dataset, session_id, budget_seconds=final_budget)
@@ -5634,6 +5987,9 @@ def run_session_improve_detailed(dataset: str, session_id: str, *, trigger: str 
         },
     )
     if ok:
+        from _session_stats import update as update_stats
+
+        update_stats(get_session_key(), improves_landed=1)
         record_improve_success(session_id, dataset, trigger)
         # Status-line credits: attribute the spend recorded since the previous
         # reading to this improve. Approximate on purpose — the submit is
@@ -5689,6 +6045,7 @@ _SWEEP_LAUNCH_RECORD_MAX_AGE_SECONDS = 30 * 24 * 3600
 #: writer; this catches files that predate the cap and logs only ever written
 #: by a child process.
 _SWEEP_LOG_FILES = (
+    "cloud-worker.log",
     "hook.log",
     "bootstrap.log",
     "watcher.log",
@@ -5787,8 +6144,32 @@ def sweep_stale_state(now: Optional[float] = None) -> dict:
             (_BRIDGE_DIR, "bridge"),
             (_PENDING_DIR, "pending"),
             (_IMPROVE_STATE_DIR, "improve_state"),
+            (_PLUGIN_DIR / "spool" / "expired", "expired_cloud_work"),
+            (_PLUGIN_DIR / "improve-wanted" / "expired", "expired_cloud_work"),
+            # The live-activity marker each session's hooks write, and the
+            # band marker the Claude Code mod writes beside it: one file per
+            # session (every /clear and resume), rewritten only while it runs.
+            (_PHASE_DIR, "phase"),
+            (_PLUGIN_DIR / "band", "band"),
         ):
             _sweep_dir_by_age(directory, _SWEEP_SESSION_FILE_MAX_AGE_SECONDS, now, counts, key)
+        sessions = _PLUGIN_DIR / "sessions"
+        if sessions.is_dir():
+            for directory in sessions.iterdir():
+                if not directory.is_dir() or directory.is_symlink():
+                    continue
+                # One session directory must not stop the rest of the sweep
+                # (log rotation included): a temp file can vanish between
+                # iterdir() and stat(), and a directory may not be removable.
+                try:
+                    newest = max((p.stat().st_mtime for p in directory.iterdir()), default=0)
+                    if now - newest > _SWEEP_SESSION_FILE_MAX_AGE_SECONDS:
+                        shutil.rmtree(directory)
+                        counts["sessions"] = counts.get("sessions", 0) + 1
+                except OSError as exc:
+                    counts.setdefault("errors", []).append(
+                        f"sessions/{directory.name}: {str(exc)[:80]}"
+                    )
         _sweep_pending_husks(counts)
         _sweep_launch_records(now, counts)
         for name in _SWEEP_LEGACY_FILES:

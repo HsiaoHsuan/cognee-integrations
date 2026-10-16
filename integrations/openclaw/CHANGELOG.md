@@ -11,9 +11,63 @@ reports an update only when the published npm version changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/). Versions are
 date-based (`YYYY.M.D`), matching the OpenClaw plugin ecosystem.
 
-## [Unreleased]
+## [2026.10.13]
+
+Brings the plugin to cognee 1.6.3 and to parity with the Claude Code and Codex
+plugins: graph-only recall trimmed to what the agent does not already have, the
+capture policy with secret redaction, a write buffer for captures made while the
+server is away, the recap tool, and a boot that never downloads an interpreter.
 
 ### Added
+- **Capture policy and secret redaction**, the rules of the Claude Code and Codex
+  `COGNEE_CAPTURE_*` settings. `captureTools` / `captureDenyTools` choose which tool
+  calls are captured: a name, an fnmatch glob, or `Tool(prefix:*)` matched against
+  the first word of a shell command (`exec(git:*)`; `cd x && git …` counts as `cd`),
+  matched case-insensitively. Calls touching `.env*`, `*.pem`, `*.key`, ssh and cloud
+  credentials, `secrets.*` or `credentials.*` (plus `captureDenyPaths`) are never
+  captured. `captureRedact` (on by default) scrubs private keys, bearer and basic
+  tokens, DB URLs, credential assignments, vendor keys, bcrypt hashes and
+  secret-named fields from captured prompts, answers and tool calls, plus
+  `captureRedactPatterns`. A pattern the plugin cannot parse fails closed: nothing is
+  captured until it is fixed, and the gateway log says why. Each unset key falls
+  back to its `COGNEE_CAPTURE_*` variable. Until now a trace stored tool arguments
+  and output as they were; the only filter skipped commands mentioning `cognee`.
+  Shared cases: `integrations/conformance/capture_policy_cases.json`.
+- **Captures made while the server is away are replayed.** A trace or QA write that
+  never reached the server (the connection could not be opened: refused while it
+  boots, host unreachable, DNS failure; or a 503) is queued in
+  `~/.openclaw/memory/cognee/pending-entries.json` (newest 500, kept a week) and
+  replayed after the next successful write, on gateway start, and, for the ending
+  session, before its session-end `/improve`. A write that timed out, was cut off
+  mid-request, or failed otherwise is not replayed, since the server may already
+  have stored it, and each replayed entry leaves the file as soon as it is stored.
+  Until now such writes were logged and dropped, and every turn of a cold boot was
+  lost.
+- **`memory_recap` tool and `openclaw cognee standup|digest|timeline`**, a port of
+  the Claude Code and Codex recap skills: what each agent worked on and left open,
+  the lessons distilled into memory, or a dated timeline of one topic, built from
+  the sessions Cognee recorded and framed as data for the model to summarize.
+  Sessions are grouped by agent. A recap only covers sessions recorded into the
+  calling agent's own datasets, so on a shared gateway one agent never sees another
+  agent's or user's conversations (`allSessions` adds other clients' sessions in
+  those datasets, never other datasets). The server cannot filter sessions by
+  dataset, so a recap reads up to 2,500 of the newest sessions and says so when the
+  server had more, or when `maxSessions` left some out, instead of passing a partial
+  window off as complete. `recapTool: false` leaves the tool out.
+- **`recallPassageChars` / `recallContextChars`** (defaults 2000 / 12000, or
+  `COGNEE_RECALL_PASSAGE_CHARS` / `COGNEE_RECALL_CONTEXT_CHARS`) bound the injected
+  recall; see Changed.
+- **Slow-server probe.** After three prompts in a row whose recall only timed out,
+  each prompt first spends a 3 s `/health` probe and skips recall while the server
+  does not answer, instead of waiting out the whole budget. Any answered recall
+  ends it.
+- **A user dataset without a user id is called out.** With `userDatasetPrefix` set
+  and no `userId` (or `OPENCLAW_USER_ID`), the user scope falls back to
+  `<prefix>-default`, one dataset every user shares; gateway start now warns.
+- **`--agent` on `openclaw cognee improve` and `visualise`**, and `--dataset` on
+  `visualise`. Under multi-scope both used to act on the configured `agentId`'s
+  dataset only, and `visualise` found no dataset at all.
+- **"What this plugin runs, stores and sends"** section in the README.
 - **`chunkSize` setting** ([#428](https://github.com/topoteretes/cognee-integrations/issues/428)).
   File sync never sent `chunk_size`, so the server chunked every memory file at its
   form default of 4096 tokens, above the input limit of embedding models such as
@@ -22,13 +76,56 @@ date-based (`YYYY.M.D`), matching the OpenClaw plugin ecosystem.
   still use the server default, because `/update` takes no chunk size.
 
 ### Changed
-- **Bundled cognee is 1.6.1** (was 1.6.0; `COGNEE_VERSION` in `src/server.ts`, and
-  `cognee-docker-compose.yaml` runs `cognee/cognee:1.6.1`). The shared
+- **Bundled cognee is 1.6.3** (was 1.6.0; `COGNEE_VERSION` in `src/server.ts`, and
+  `cognee-docker-compose.yaml` runs `cognee/cognee:1.6.3`). The shared
   `~/.cognee-plugin/venv` is upgraded on the next cold boot, which runs that
-  release's migrations. 1.6.1 is a patch release: chunks carry their document's
-  external metadata into hybrid retrieval, provenance is scoped to the caller's
-  readable datasets, and `dlt` is now a core dependency, which the venv install
-  pulls in on its own. The claude-code and codex plugins move to the same pin.
+  release's migrations (1.6.3 adds a capability layer for permissions). 1.6.1 carries
+  chunk metadata into hybrid retrieval and makes `dlt` a core dependency; 1.6.2 sizes
+  chunks to the embedding model's input limit (an explicit `chunkSize` above it is
+  lowered, with a server-side warning) and explains a bare 401; 1.6.3 routes
+  date-scoped questions to temporal search when no search type is given (the plugin
+  always sends one) and moves LanceDB to 0.39.
+- **Recall injects the retrieved context only, not the conversation the agent
+  already has (SDK-904).** The graph recall is now sent without the session id:
+  with it, cognee >= 1.6.0 put this session's recent turns in front of the item's
+  text, which was most of a mid-session payload. Each item is then cut down to its
+  retrieved context: the question template goes, passages recorded in this session
+  go, each passage is capped at `recallPassageChars` (cut at a paragraph break), the
+  whole at `recallContextChars` (dropping whole passages from the end), and entity
+  lines that say nothing are pruned. Text that does not parse (an older server's
+  bare context) is injected whole. This session's guidance comes from its own
+  `scope: ["session_context"]` request against the capture dataset and is injected
+  as `<cognee_guidance>`. The same rules as the Claude Code and Codex plugins,
+  shared through `integrations/conformance/recall_text_cases.json`. On top of that,
+  `recallContextChars` bounds the whole injection (guidance first, then each
+  dataset's memory, then code facts; the block that crosses it is cut at a line and
+  marked), so several scopes cannot add up past it. The graph, guidance and code
+  lanes are independent: guidance is injected even when the graph has nothing or
+  fails, and a lane not done by the recall deadline is dropped instead of costing
+  the turn the others. `maxTokens` and
+  `recallSessionLayers` are deprecated no-ops, kept so existing configs validate.
+- **Recall timeouts are 20 s** (`recallTimeoutMs` and `recallBudgetMs`, were 10 s and
+  12 s), the budget the Claude Code and Codex plugins moved to.
+- **The boot never downloads an interpreter.** `ensure_and_boot.py` used
+  `uv venv --python 3.12`, which let uv download a standalone Python. It now asks uv
+  for any 3.10–3.14 already on the machine with `UV_PYTHON_DOWNLOADS=never`, and
+  falls back to `python3.14` … `python3.10`, `python3`, `python` with `-m venv` (also
+  when uv finds none). The pinned `cognee` package is the only download. With no
+  suitable interpreter it refuses and says so, as before. When uv's install fails,
+  the pip fallback first seeds pip into the venv uv built (uv venvs have none), and
+  the boot error recorded for the gateway log leads with uv's own reason.
+- **The local server starts in `~/.cognee-plugin`, and reads its settings from
+  `~/.cognee/.env`.** cognee >= 1.6.2 loads the first `.env` it finds walking up from
+  its working directory and lets it override the process environment, so a `.env`
+  in the directory the gateway was started from could replace the default user,
+  data directories or auth settings the boot passes. The server now runs from the
+  plugin's state directory instead, and the boot script loads `~/.cognee/.env` (or
+  `COGNEE_ENV_FILE`) the way the Claude Code and Codex plugins do: values act like
+  exports, a variable already in the environment wins, and names such as `PATH` or
+  `LD_*` are skipped. **If you kept `LLM_API_KEY` (or other server settings) in a
+  `.env` in the directory you start the gateway from, move it to `~/.cognee/.env`**,
+  or export it; that file is no longer read, and without a key the server cannot
+  build the graph.
 
 ### Fixed
 - **Long-running ingestion requests can exceed Node's 300s bundled-undici header timeout**
@@ -41,6 +138,7 @@ date-based (`YYYY.M.D`), matching the OpenClaw plugin ecosystem.
   The 401 re-login retry now keeps its abort deadline while it reads the response
   body; it used to clear the timer first, so a stalled body could hang the request.
   `undici` is pinned to exactly 7.30.0, the plugin's only runtime dependency.
+  Contributed by @Dotbo-7210 (#470).
 - **Documented settings no longer get the plugin quarantined**
   ([#438](https://github.com/topoteretes/cognee-integrations/issues/438)).
   `perAgentMemory`, `noiseTriggers` and `noisePatterns` are documented and read by
@@ -62,6 +160,32 @@ date-based (`YYYY.M.D`), matching the OpenClaw plugin ecosystem.
   read with `ps` or `/proc/<pid>/cmdline` for as long as the watcher runs. It now
   travels in the watcher's environment (`COGNEE_API_KEY`), matching the earlier
   fix for the Claude Code and Codex plugins (#395). Contributed by @pinzo (#425).
+- **Windows memory files in subdirectories sync again.** `memory\2026-10-02.md`
+  was uploaded as `memory\2026-10-02-md` while cognee stored `memory_2026-10-02-md`,
+  so the plugin never matched the returned id, and the next edit was re-added
+  instead of updated (409). Both separators are now sanitized. Contributed by
+  @susumanin (#466).
+- **Session-end improve stops on an exhausted LLM budget.** cognee 1.6.3 answers 402
+  when the server's LLM budget runs out; the session-end chain retried it twice more
+  10 s apart. It now logs why and stops.
+- **Blank `node_set` entries are never sent.** cognee 1.6.3 rejects them with 400.
+- **The exit watcher bridges the right session after a dataset switch.** It was given
+  the conversation's session and dataset when spawned, so a gateway that died after
+  `memory_switch_dataset` bridged the old session into the old dataset and left the
+  new one unbridged. The plugin now keeps the current pair next to the watcher's
+  pidfile.
+- **Recall finds a dataset created after the gateway started.** A lookup that found
+  no dataset by name (a fresh install's first prompt, before anything was stored)
+  was cached for the gateway's lifetime, so recall stayed off until a restart even
+  after memory had been written. A miss is now retried after 30 s.
+- **Sessions are recorded with their dataset from the first turn.** `/remember/entry`
+  does not create the capture dataset, and the server records a session's dataset
+  from the write that opens it, so the first session on a fresh install was stored
+  without one. Session start now creates the capture dataset (create-or-return)
+  before the first capture, which also lets recall and recaps find it at once.
+- **A configured `apiKey` is honored at session end.** The session-end chain
+  resolved the key without the configured one, so a cached minted key in
+  `~/.cognee-plugin/api_key.json` could win over it.
 
 ## [2026.9.22]
 

@@ -45,6 +45,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
+from _injection_budget import fit_sections, injection_limit
 from _plugin_common import (  # noqa: E402
     DEFINITIVE_FAILURE_STATES,
     _float_env,
@@ -342,7 +343,7 @@ def format_code_facts(facts: list[dict], rel: str, max_symbols: int = DEFAULT_MA
         "constant",
     ]
     for skind in sorted(by_kind, key=lambda k: (order.index(k) if k in order else len(order), k)):
-        lines.append(f"  {_plural(skind)}: " + ", ".join(by_kind[skind]))
+        lines.extend(f"  {_plural(skind)}: {symbol}" for symbol in by_kind[skind])
     if len(symbols) > len(shown):
         lines.append(f"  … {len(symbols) - len(shown)} more symbols not shown")
     if calls_out:
@@ -385,6 +386,25 @@ def format_graph_hits(results: list) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _block_section(block: str, source: str, priority: int) -> dict:
+    """Keep each symbol/hit whole, with compact spacing and one shared heading."""
+    title, _, body = block.partition("\n")
+    entries = []
+    for line in body.splitlines():
+        if line.startswith("(This file changed") or line.startswith("  … "):
+            title += "\n" + line
+        elif line.strip():
+            entries.append(line)
+    return {
+        "title": title,
+        "entries": entries,
+        "priority": priority,
+        "separator": "\n",
+        "source": source,
+        "entry_ids": {entry: i for i, entry in enumerate(entries)},
+    }
+
+
 def build_context(file_path: str, lane: dict, resolved: dict, deadline: float) -> tuple[str, dict]:
     """Run the enabled lanes inside the deadline; returns (context, stats).
 
@@ -394,7 +414,7 @@ def build_context(file_path: str, lane: dict, resolved: dict, deadline: float) -
     to every lane erroring, timing out, or being skipped for lack of budget.
     """
     stats: dict = {"code": 0, "graph": 0, "lanes": [], "answered": False}
-    sections: list[str] = []
+    sections: list[dict] = []
     lanes = scopes()
     session_id = str(resolved.get("session_id") or "")
 
@@ -430,7 +450,7 @@ def build_context(file_path: str, lane: dict, resolved: dict, deadline: float) -
                             "\n(This file changed after the code graph was last indexed: "
                             "line numbers may have shifted — trust the file.)"
                         )
-                    sections.append(block)
+                    sections.append(_block_section(block, "code", 2))
             except Exception as exc:
                 hook_log(
                     "file_context_error",
@@ -459,7 +479,7 @@ def build_context(file_path: str, lane: dict, resolved: dict, deadline: float) -
                 block = format_graph_hits(results)
                 stats["graph"] = block.count("\n  - ") if block else 0
                 if block:
-                    sections.append(block)
+                    sections.append(_block_section(block, "graph", 1))
             except Exception as exc:
                 hook_log(
                     "file_context_error",
@@ -469,12 +489,24 @@ def build_context(file_path: str, lane: dict, resolved: dict, deadline: float) -
 
     if not sections:
         return "", stats
-    body = "\n\n".join(sections)
-    footer = (
-        "(Cognee file context — from the code graph; for callers or impact use "
-        '`cognee-search.sh "<symbol>" --code`.)'
+    fitted, budget_stats = fit_sections(
+        [{"entries": [f"## Cognee: about {os.path.basename(file_path)}"], "required": True}]
+        + sections
+        + [
+            {
+                "entries": ['(For more: cognee-search.sh "<symbol>" --code)'],
+                "priority": 0,
+                "counted": False,
+            }
+        ],
+        injection_limit(),
+        measure=lambda text: len(json.dumps(_output(text))) + 1,
     )
-    return f"## Cognee: about {os.path.basename(file_path)}\n{body}\n{footer}", stats
+    stats.update(retrieved_code=stats["code"], retrieved_graph=stats["graph"])
+    stats.update({k: v for k, v in budget_stats.items() if k not in {"entries", "source_hits"}})
+    for source in ("code", "graph"):
+        stats[source] = budget_stats["source_hits"].get(source, 0)
+    return fitted if budget_stats["entries_kept"] else "", stats
 
 
 def _int_env(name: str, default: int) -> int:
@@ -484,17 +516,17 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _output(context: str) -> dict:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": context,
+        }
+    }
+
+
 def emit(context: str) -> None:
-    print(
-        json.dumps(
-            {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "additionalContext": context,
-                }
-            }
-        )
-    )
+    print(json.dumps(_output(context)))
 
 
 def run(payload: dict) -> str:

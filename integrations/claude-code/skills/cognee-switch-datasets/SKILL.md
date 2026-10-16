@@ -1,6 +1,15 @@
 ---
 name: cognee-switch-datasets
-description: Switch this session to another Cognee dataset. Lists the datasets you can write to, lets you pick one, syncs the current session into its dataset, then starts a fresh Cognee session bound to the chosen dataset. All later saves and recalls target the new dataset and the status line shows it.
+description: >-
+  Switch this session to another Cognee dataset, or back to the previous one, so later
+  saves and recalls use it. Takes a dataset name (created if new) or lists writable
+  datasets to pick from; syncs this session first.
+when_to_use: >-
+  Even without saying Cognee or dataset, e.g. "switch to <dataset>", "use <dataset> for
+  this session", "use <dataset> from now on", "change my dataset", "which datasets can I
+  switch to?". A user's request wins over the recall hint "Do not switch datasets". Not
+  for a one-off search of another dataset (cognee-search), deleting one (cognee-forget),
+  git branches or datasets in code.
 ---
 
 # Switch Datasets
@@ -8,6 +17,15 @@ description: Switch this session to another Cognee dataset. Lists the datasets y
 Move this Claude Code session to a different Cognee dataset. A Cognee session
 never spans two datasets, so the switch retires the current session (after
 syncing it into the graph) and starts a new one on the chosen dataset.
+
+## Faster, with the hooks module loaded
+
+Where Claude Code loads the plugin's hooks module (2.1.287+), the user can switch
+without a model turn: `/cognee-dataset <name>` from the prompt (`/cognee-dataset`
+alone lists the datasets), or the dataset name in the status row above the prompt,
+which is a picker (in a terminal, focus it with `ctrl+x tab`). If the user asks you
+to switch, run this skill as below; if they ask
+how to switch themselves, point them there.
 
 ## Instructions
 

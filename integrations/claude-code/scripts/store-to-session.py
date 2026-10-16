@@ -23,6 +23,7 @@ import urllib.error
 
 # Add scripts dir to path for helper imports
 sys.path.insert(0, os.path.dirname(__file__))
+from _cloud_worker import enabled as cloud_enabled
 from _plugin_common import (
     append_warmup_entry,
     bump_save_counter,
@@ -36,6 +37,8 @@ from _plugin_common import (
     is_observer_child,
     load_resolved,
     notify,
+    phase_begin,
+    phase_end,
     pop_pending_prompt,
     quiet_hook_output,
     record_payment_required,
@@ -60,15 +63,20 @@ async def _fire_improve_background(dataset: str, session_id: str, reason: str) -
     """Fire-and-forget session improve; failures are logged but never raised.
 
     The server bridges the session itself from its session cache (improve);
-    see run_session_improve_detailed. Shares the cooldown / backoff gate with the
-    idle watcher; the session-end sync ignores it and covers whatever a skip
-    here leaves behind. Without server auth there is nothing to submit to —
-    the session-end sync picks the session up once a key is available.
+    see run_session_improve_detailed. Honours the cooldown / backoff gate; the
+    session-end sync ignores it and covers whatever a skip here leaves behind.
+    Without server auth there is nothing to submit to — the session-end sync
+    picks the session up once a key is available.
     """
     import _distill
 
     if _distill.enabled():
         return  # distill runs at idle and session end, never every few turns
+    if cloud_enabled():
+        from _cloud_worker import request_improve
+
+        request_improve(dataset, session_id, reason)
+        return
     improve_start = time.monotonic()
     throttled = improve_throttle_reason(session_id)
     if throttled:
@@ -81,7 +89,11 @@ async def _fire_improve_background(dataset: str, session_id: str, reason: str) -
         if not http_api_ready():
             hook_log("auto_improve_skipped_no_auth", {"reason": reason, "session": session_id})
             return
-        outcome = run_session_improve_detailed(dataset, session_id, trigger="auto")
+        phase_begin("consolidating")
+        try:
+            outcome = run_session_improve_detailed(dataset, session_id, trigger="auto")
+        finally:
+            phase_end("consolidating", ok=bool(locals().get("outcome", {}).get("ok")))
         wrote = bool(outcome.get("ok"))
         hook_log(
             "auto_improve_fired",
@@ -130,6 +142,11 @@ def _infer_status(payload: dict) -> tuple[str, str]:
         if response.get("is_error") or response.get("error"):
             err = response.get("error") or response.get("message") or "Tool reported an error."
             return "error", _truncate_str(err, 500)
+        if response.get("interrupted"):
+            return "error", "Tool interrupted."
+        exit_code = response.get("exit_code", response.get("exitCode", 0))
+        if exit_code not in (0, "0", None):
+            return "error", "Tool exited with code %s." % exit_code
     if isinstance(payload.get("error"), str) and payload["error"]:
         return "error", _truncate_str(payload["error"], 500)
     return "success", ""
@@ -150,12 +167,40 @@ def _load_session() -> tuple[str, str, str]:
     return session_id, dataset, user_id
 
 
+def _low_signal_trace(tool: str, output, status: str) -> bool:
+    if tool in {"Read", "Grep", "Glob"}:
+        return True
+    if tool != "Bash" or status != "success":
+        return False
+    if isinstance(output, dict):
+        if output.get("exit_code", 0) or output.get("exitCode", 0) or output.get("interrupted"):
+            return False
+        # Claude Code adds flags such as isImage/noOutputExpected; only the
+        # output streams decide. A result without either stream is unknown.
+        if "stdout" not in output and "stderr" not in output:
+            return False
+        if output.get("isImage") or output.get("is_error"):
+            return False
+        return (
+            not str(output.get("stdout") or "").strip()
+            and not str(output.get("stderr") or "").strip()
+        )
+    return output is None or (isinstance(output, str) and not output.strip())
+
+
 async def _store_tool_call(payload: dict) -> None:
     """Write a PostToolUse event as a TraceEntry."""
     tool_name = payload.get("tool_name", "unknown")
     tool_input = payload.get("tool_input") or {}
     tool_output = payload.get("tool_output") or payload.get("tool_response") or ""
-    from _capture_policy import CapturePatternError, allow_tool, redact
+    from _capture_policy import (
+        CapturePatternError,
+        allow_tool,
+        is_plugin_invocation,
+        low_signal_bash,
+        redact,
+        safe_first_token,
+    )
 
     try:
         allowed = allow_tool(tool_name, tool_input)
@@ -171,17 +216,53 @@ async def _store_tool_call(payload: dict) -> None:
     tool_output = redact(tool_output)
     payload = redact(payload)
 
-    # Suppress self-reference: any Bash call that mentions 'cognee' is
-    # likely the plugin/CLI talking to itself and would recurse.
-    if tool_name == "Bash":
-        cmd = ""
-        if isinstance(tool_input, dict):
-            cmd = str(tool_input.get("command", ""))
-        if "cognee" in cmd:
-            hook_log("skip_self_cognee_bash", {"cmd_prefix": cmd[:80]})
-            return
-
+    command = str(tool_input.get("command", "")) if isinstance(tool_input, dict) else ""
     status, error_message = _infer_status(payload)
+    reason = is_plugin_invocation(command) if tool_name == "Bash" else ""
+    low_signal = tool_name == "Bash" and low_signal_bash(command, tool_output, status)
+    # Cloud mode also drops Read/Grep/Glob and Bash calls that succeeded with no output.
+    low_signal = low_signal or (
+        cloud_enabled() and _low_signal_trace(tool_name, tool_output, status)
+    )
+    from _session_stats import update
+
+    if tool_name == "Bash":
+        hook_log(
+            "bash_capture_decision",
+            {
+                "host_session_id": get_session_key(),
+                "outcome": "skipped_self"
+                if reason
+                else "skipped_low_signal"
+                if low_signal
+                else "captured",
+            },
+        )
+        update(
+            get_session_key(),
+            bash_post_tool_use=1,
+            bash_skipped_self=int(bool(reason)),
+            bash_skipped_low_signal=int(not reason and low_signal),
+            bash_traces_captured=int(not reason and not low_signal),
+        )
+    if reason or low_signal:
+        update(
+            get_session_key(),
+            traces_skipped=1,
+            traces_skipped_self=int(bool(reason)),
+            traces_skipped_low_signal=int(not reason),
+        )
+    if reason:
+        hook_log(
+            "skip_self_cognee_bash", {"first_token": safe_first_token(command), "reason": reason}
+        )
+        return
+    if low_signal:
+        hook_log(
+            "trace_skipped_low_signal",
+            {"tool": tool_name, "first_token": safe_first_token(command)},
+        )
+        return
 
     # Normalize method_params: small structured dict is ideal; fall back
     # to a truncated-string dict if we got something non-JSON-safe.
@@ -224,6 +305,13 @@ async def _store_tool_call(payload: dict) -> None:
         "generate_feedback_with_llm": False,
     }
 
+    if cloud_enabled(runtime):
+        from _cloud_worker import enqueue
+
+        enqueue(dataset, session_id, entry, "trace")
+        bump_save_counter(session_id, "trace", buffered=True)
+        return
+
     if not server_usable(runtime.get("base_url", "")):
         # Server unreachable (stale marker AND a failed probe — a stale marker
         # alone no longer buffers; this hook fires per tool call, so its probe
@@ -236,6 +324,7 @@ async def _store_tool_call(payload: dict) -> None:
         hook_log("store_buffered_warming", {"hook": "tool", "tool": tool_name})
         return
 
+    phase_begin("saving")
     try:
         result = remember_entry_via_http(dataset, session_id, entry)
     except Exception as exc:
@@ -247,6 +336,9 @@ async def _store_tool_call(payload: dict) -> None:
         # rejected one would block every entry behind it.
         status_code = exc.code if isinstance(exc, urllib.error.HTTPError) else None
         retryable = status_code is None or status_code >= 500
+        # Not saved: the row says "save queued" for a buffered write, "save
+        # failed" for one dropped for good.
+        phase_end("saving", count=0, ok=False, buffered=retryable)
         if retryable:
             # A timeout or gateway error may have landed server-side; mark the
             # buffered copy so the drain verifies before re-sending —
@@ -274,6 +366,7 @@ async def _store_tool_call(payload: dict) -> None:
             notify(f"trace store failed ({exc})")
         return
 
+    phase_end("saving", count=1 if result else 0, ok=bool(result))
     if result:
         clear_payment_required()
         trace_id = (
@@ -298,6 +391,33 @@ async def _store_tool_call(payload: dict) -> None:
             await _fire_improve_background(dataset, session_id, reason=f"turn_{count}")
     else:
         hook_log("trace_store_noresult", {"tool": tool_name})
+
+
+def _check_memory_credit(payload: dict) -> None:
+    """Check the answer's Cognee credits against the session's tags (SDK-1071).
+
+    The recall hook tags each injected item ``m1``, ``m2``… and keeps a
+    memory's tag for the whole session. A cited tag the session handed out is
+    a valid credit (``earlier`` when it was not injected on this turn); one it
+    never handed out is invented. Both go to the log, which measures how
+    reliably agents credit memory, and the first valid credit switches off the
+    longer first-credit wording for the rest of the session. Local only:
+    nothing is sent anywhere.
+    """
+    import _plugin_common
+    from _recall_text import MemoryTags, check_credits, credit_enabled, record_credit
+
+    if not credit_enabled(_plugin_common.CITE_MEMORY_DEFAULT):
+        return
+    msg = str(payload.get("assistant_message") or payload.get("last_assistant_message") or "")
+    if not msg or msg == "null":
+        return
+    key = get_session_key()
+    result = check_credits(msg, MemoryTags.load(_plugin_common._PLUGIN_DIR, key))
+    if not result["cited"] and not result["available"]:
+        return  # nothing injected, nothing cited: not a turn that could credit
+    record_credit(_plugin_common._PLUGIN_DIR, key, result, ts=str(int(time.time())))
+    hook_log("memory_credit", result)
 
 
 async def _store_assistant_stop(payload: dict) -> None:
@@ -342,6 +462,14 @@ async def _store_assistant_stop(payload: dict) -> None:
         "context": redact(pending.get("context", "")),
     }
 
+    if cloud_enabled(runtime):
+        from _cloud_worker import enqueue
+
+        # The worker counts delivered entries toward the every-N improve trigger.
+        enqueue(dataset, session_id, entry, "answer")
+        bump_save_counter(session_id, "answer", buffered=True)
+        return
+
     if not server_usable(runtime.get("base_url", "")):
         # Server unreachable (stale marker AND a failed probe): buffer the
         # structured entry for a later /remember/entry replay (improve bridges
@@ -351,6 +479,7 @@ async def _store_assistant_stop(payload: dict) -> None:
         hook_log("store_buffered_warming", {"hook": "stop"})
         return
 
+    phase_begin("saving")
     try:
         result = remember_entry_via_http(dataset, session_id, entry)
     except Exception as exc:
@@ -369,6 +498,7 @@ async def _store_assistant_stop(payload: dict) -> None:
         # retryable, so those are buffered and anything else is dropped loudly.
         status = exc.code if isinstance(exc, urllib.error.HTTPError) else None
         retryable = status is None or status >= 500
+        phase_end("saving", count=0, ok=False, buffered=retryable)
         if retryable:
             # Ambiguous outcomes (timeout / gateway error after the request
             # went out) are verified against the server before replay — see
@@ -390,6 +520,7 @@ async def _store_assistant_stop(payload: dict) -> None:
             notify(f"stop store failed ({exc})")
         return
 
+    phase_end("saving", count=1 if result else 0, ok=bool(result))
     if result:
         clear_payment_required()
         qa_id = (
@@ -471,10 +602,15 @@ def main():
     try:
         with quiet_hook_output("store-to-session"):
             if is_stop:
+                try:
+                    _check_memory_credit(payload)
+                except Exception as exc:
+                    hook_log("memory_credit_failed", {"error": str(exc)[:200]})
                 asyncio.run(_store_assistant_stop(payload))
                 # End-of-turn code-graph freshness: independent of whether an
                 # assistant message was stored (edits happen either way).
-                _maybe_reingest_code_repo(payload)
+                if not cloud_enabled():
+                    _maybe_reingest_code_repo(payload)
             else:
                 asyncio.run(_store_tool_call(payload))
     except Exception as exc:

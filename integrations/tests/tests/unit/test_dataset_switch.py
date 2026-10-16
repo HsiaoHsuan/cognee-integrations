@@ -194,6 +194,76 @@ def test_list_writable_without_user_id_is_unfiltered(pc, monkeypatch):
     assert [r["name"] for r in out["datasets"]] == ["x"] and out["filtered"] is False
 
 
+def test_list_writable_survives_a_server_without_users_me(pc, monkeypatch):
+    """Some tenants answer 404 on /users/me. With no user id from the launch
+    record the lister asked there, and the 404 took the whole listing down
+    (the picker then never appeared) although /datasets had answered."""
+    import urllib.error
+
+    rows = [
+        {"name": "agent_sessions", "id": "1", "ownerId": "someone"},
+        {"name": "default_dataset", "id": "2"},
+    ]
+
+    def response(path, **kwargs):
+        if path.endswith("/users/me"):
+            raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
+        assert "/permissions/" not in path, "no user id, so no write check"
+        return rows
+
+    monkeypatch.setattr(pc, "_json_http_request", response)
+    monkeypatch.setattr(pc, "hook_log", lambda *a, **k: None)
+    out = pc.list_writable_datasets("")
+    assert [r["name"] for r in out["datasets"]] == ["agent_sessions", "default_dataset"]
+    assert all(r["writable"] is None for r in out["datasets"]) and out["filtered"] is False
+
+
+def test_list_writable_takes_the_user_from_the_connection_lookup(pc, monkeypatch):
+    """With no id in the launch record the lister asks the data plane's
+    connection lookup, which the key answers on cloud tenants and OSS servers
+    alike, and the write check then runs with that id; /users/me is not asked."""
+    import urllib.error
+
+    asked: list = []
+    rows = [
+        {"name": "mine", "id": "1", "ownerId": "69d2a169"},
+        {"name": "shared-with-me", "id": "2", "ownerId": "someone"},
+        {"name": "theirs", "id": "3", "ownerId": "someone"},
+    ]
+
+    def response(path, **kwargs):
+        asked.append(path)
+        if path.endswith("/agents/connections/me"):
+            return {"agent": {"id": "conn_x", "user_id": "69d2a169", "status": "active"}}
+        if "/permissions/principals/69d2a169/datasets" in path:
+            return [rows[0], rows[1]]
+        if path.endswith("/users/me"):
+            raise urllib.error.HTTPError(path, 404, "Not Found", {}, None)
+        return rows
+
+    monkeypatch.setattr(pc, "_json_http_request", response)
+    monkeypatch.setattr(pc, "_local_api_url", lambda: "https://tenant-abc.stg-aws.cognee.ai")
+    out = pc.list_writable_datasets("")
+    assert [r["name"] for r in out["datasets"]] == ["mine", "shared-with-me"]
+    assert out["readonly"] == ["theirs"] and out["filtered"] is True
+    assert not any(p.endswith("/users/me") for p in asked), asked
+
+
+def test_list_writable_never_asks_a_cloud_tenant_for_users_me(pc, monkeypatch):
+    """The route lives on the platform API, not the tenant data plane."""
+    asked: list = []
+
+    def response(path, **kwargs):
+        asked.append(path)
+        return [{"name": "agent_sessions", "id": "1", "ownerId": "someone"}]
+
+    monkeypatch.setattr(pc, "_json_http_request", response)
+    monkeypatch.setattr(pc, "_local_api_url", lambda: "https://tenant-abc.stg-aws.cognee.ai")
+    out = pc.list_writable_datasets("")
+    assert [r["name"] for r in out["datasets"]] == ["agent_sessions"]
+    assert not any(p.endswith("/users/me") for p in asked), asked
+
+
 # ── launch discovery without a hook payload ────────────────────────────────
 
 
