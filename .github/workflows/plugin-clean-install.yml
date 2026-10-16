@@ -191,7 +191,7 @@ jobs:
       # the plugin tree of the revision just cloned.
       - name: "Claude Code: install cognee-memory@cognee"
         run: |
-          claude plugin install cognee-memory@cognee --json
+          claude plugin install cognee-memory@cognee
           claude plugin list --json | node -e '
             let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
               const p = JSON.parse(s).find(p => p.id === "cognee-memory@cognee" && p.enabled);
