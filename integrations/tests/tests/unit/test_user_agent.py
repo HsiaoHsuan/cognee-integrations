@@ -41,8 +41,11 @@ def seen_agents():
 
 
 def test_plugin_requests_carry_the_plugin_user_agent(suite, isolated_modules, seen_agents):
-    isolated_modules(suite, "_plugin_common")
     url, agents = seen_agents
+    # An earlier urlopen() caches the global opener before the plugin patches it.
+    urllib.request.urlopen(url, timeout=5).read()
+    agents.clear()
+    isolated_modules(suite, "_plugin_common")
     urllib.request.urlopen(url, timeout=5).read()
     # context= makes urlopen build a fresh opener, the path most plugin calls take.
     urllib.request.urlopen(url, timeout=5, context=ssl.create_default_context()).read()
