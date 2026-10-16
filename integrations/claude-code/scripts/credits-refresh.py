@@ -25,6 +25,13 @@ def main():
     if is_observer_child():
         return
     sys.stdin.read()  # consume the hook payload as the host requires
+    from _cloud_worker import enabled as cloud_enabled
+    from _cloud_worker import ensure_worker
+
+    if cloud_enabled():
+        ensure_worker()
+        return
+
     try:
         with quiet_hook_output("credits-refresh"):
             marker = refresh_credits("turn")

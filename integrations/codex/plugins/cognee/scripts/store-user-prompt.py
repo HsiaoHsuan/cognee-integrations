@@ -72,7 +72,7 @@ def _watcher_alive() -> bool:
 
 
 def _ensure_idle_watcher(session_id: str, dataset: str, user_id: str, config: dict) -> None:
-    """Start the idle watcher on a new prompt if the prior one exited after bridging."""
+    """Start the idle watcher on a new prompt if none is running."""
     if os.environ.get("COGNEE_IDLE_DISABLED", "").lower() in ("1", "true", "yes"):
         return
     if not session_id or _watcher_alive():

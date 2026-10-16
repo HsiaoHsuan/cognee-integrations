@@ -10,6 +10,23 @@ The version must match the `version` field in both `pyproject.toml` and
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.2]
+
+### Added
+- **The session is bridged into the graph before context compression.** Hermes
+  compresses long conversations lossily and calls `on_pre_compress(messages)`
+  first; the plugin did not implement it, so `improve()` ran only at session end
+  and turns compressed away earlier could be lost before reaching the graph if
+  the session never closed cleanly. `on_pre_compress` now starts the same
+  session improve (same dataset and cognee session id, same remote/local
+  transport) on a worker thread. It is best-effort (Hermes pre-compress
+  checkpoint API v1): compression never waits on it, a failure is logged as a
+  warning and never raised, a compaction while the previous one's improve is
+  still running does not start a second, and it contributes no text to the
+  summary prompt. Gated like the session-end improve (`improve_on_end`, writes
+  enabled, breaker closed); the session-end improve still runs.
+  `on_pre_compress` is declared in both `plugin.yaml` files.
+
 ## [1.3.1]
 
 ### Changed

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import type { RecapApi } from "./recap.js";
 import { Agent, FormData as UndiciFormData, fetch as undiciFetch } from "undici";
 import type {
   CogneeAddResponse,
@@ -63,6 +64,23 @@ async function fetchWithLongRequestSupport(url: string, init: RequestInit): Prom
 // Extracted so both the memory plugin and skills plugin can share one
 // implementation instead of duplicating ~200 lines of fetch/auth logic.
 // ---------------------------------------------------------------------------
+
+/**
+ * A non-2xx answer from Cognee. The message keeps the historical
+ * "Cognee request failed (<status>): <body>" shape; `status` lets callers tell
+ * outcomes apart without parsing it (e.g. 402 = LLM budget exhausted).
+ */
+export class CogneeRequestError extends Error {
+  constructor(readonly status: number, readonly body: string) {
+    super(`Cognee request failed (${status}): ${body}`);
+    this.name = "CogneeRequestError";
+  }
+}
+
+/** HTTP status of a failed Cognee request, or undefined for transport errors. */
+export function requestErrorStatus(error: unknown): number | undefined {
+  return error instanceof CogneeRequestError ? error.status : undefined;
+}
 
 /**
  * Turn a failed /auth/login response into an actionable error message.
@@ -233,7 +251,7 @@ export class CogneeHttpClient {
                 : await fetch(`${this.baseUrl}${path}`, retryInit);
             if (!retryResponse.ok) {
               const errorText = await retryResponse.text();
-              throw new Error(`Cognee request failed (${retryResponse.status}): ${errorText}`);
+              throw new CogneeRequestError(retryResponse.status, errorText);
             }
             // `await` keeps the retry's abort timer armed while the body is read;
             // without it `finally` clears the timer first, and a stalled body on
@@ -246,7 +264,7 @@ export class CogneeHttpClient {
 
         if (!response.ok) {
           const errorText = await response.text();
-          throw new Error(`Cognee request failed (${response.status}): ${errorText}`);
+          throw new CogneeRequestError(response.status, errorText);
         }
         // Honor responseParser on the success path (gh #195, SDK-242) — the
         // `await` is load-bearing: it keeps a parser/body-read rejection (a
@@ -379,9 +397,9 @@ export class CogneeHttpClient {
     if (typeof params.chunkSize === "number" && params.chunkSize > 0) {
       formData.append("chunk_size", String(params.chunkSize));
     }
-    if (params.nodeSet && params.nodeSet.length > 0) {
-      for (const node of params.nodeSet) formData.append("node_set", node);
-    }
+    // cognee >= 1.6.3 answers a blank node_set entry with 400 on /add and
+    // /update; never send one.
+    for (const node of cleanNodeSet(params.nodeSet)) formData.append("node_set", node);
 
     const response = await this.fetchAPI<CogneeRememberResponse>(
       path,
@@ -498,6 +516,48 @@ export class CogneeHttpClient {
       : `/api/v1/datasets/${datasetId}/data/${dataId}/raw`;
     const text = await this.fetchAPI<string>(path, { method: "GET" }, this.timeoutMs, async (r: Response) => await r.text());
     return typeof maxChars === "number" && text.length > maxChars ? text.slice(0, maxChars) : text;
+  }
+
+  /**
+   * The endpoints the standup / digest / timeline recaps read (recap.ts does
+   * no HTTP itself). Same requests as cognee-recap.py in the claude-code and
+   * codex plugins.
+   */
+  recapApi(): RecapApi {
+    const p = (path: string) => (this.isCloud ? path : `/api/v1${path}`);
+    const RECAP_TIMEOUT_MS = 30_000;
+    return {
+      listSessions: ({ range, limit, offset }) =>
+        this.fetchAPI<unknown>(p(`/sessions?${new URLSearchParams({ range, limit: String(limit), offset: String(offset) })}`), { method: "GET" }),
+      getSession: async (sessionId) => {
+        try {
+          return await this.fetchAPI<unknown>(p(`/sessions/${encodeURIComponent(sessionId)}`), { method: "GET" });
+        } catch (error) {
+          if (requestErrorStatus(error) === 404) return null; // unknown session: empty, not an error
+          throw error;
+        }
+      },
+      listDatasetData: (datasetId, { limit, offset }) =>
+        this.fetchAPI<unknown>(
+          p(`/datasets/${datasetId}/data?${new URLSearchParams({ limit: String(limit), offset: String(offset) })}`),
+          { method: "GET" },
+          RECAP_TIMEOUT_MS,
+        ),
+      getDataRaw: (datasetId, dataId) =>
+        this.fetchAPI<string>(p(`/datasets/${datasetId}/data/${dataId}/raw`), { method: "GET" }, RECAP_TIMEOUT_MS, async (r: Response) => await r.text()),
+      recallGraph: ({ query, datasetIds, topK, timeoutMs }) =>
+        this.fetchAPI<unknown>(
+          p("/recall"),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ query, top_k: topK, scope: ["graph"], only_context: true, dataset_ids: datasetIds }),
+          },
+          timeoutMs,
+          undefined,
+          0,
+        ),
+    };
   }
 
   async resolveDataIdFromDataset(datasetId: string, fileName: string): Promise<string | undefined> {
@@ -680,7 +740,9 @@ export class CogneeHttpClient {
   async recall(params: {
     queryText: string;
     searchPrompt: string;
-    searchType: CogneeSearchType;
+    /** Always set for graph and code recall: unset, cognee >= 1.6.3 auto-routes
+     *  date-scoped questions to TEMPORAL. The session_context scope takes none. */
+    searchType?: CogneeSearchType;
     datasetIds: string[];
     topK?: number;
     sessionId?: string;
@@ -704,7 +766,7 @@ export class CogneeHttpClient {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           query: params.queryText,
-          search_type: params.searchType,
+          ...(params.searchType ? { search_type: params.searchType } : {}),
           dataset_ids: params.datasetIds,
           only_context: params.onlyContext ?? true,
           ...(typeof params.topK === "number" ? { top_k: params.topK } : {}),
@@ -1005,6 +1067,11 @@ export function normalizeSearchResults(data: unknown): CogneeSearchResult[] {
  * a flat `{ status, ... }`. Reading `.status` off the map yielded undefined
  * and the plugin logged `status=?` on every session end.
  */
+/** Trimmed, non-empty node_set entries (cognee >= 1.6.3 rejects blank ones). */
+export function cleanNodeSet(nodeSet: readonly string[] | undefined): string[] {
+  return (nodeSet ?? []).map((n) => (typeof n === "string" ? n.trim() : "")).filter(Boolean);
+}
+
 export function normalizeImproveResponse(data: unknown): CogneeImproveResult {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     return { error: `unexpected improve response: ${data === null ? "null" : Array.isArray(data) ? "array" : typeof data}` };

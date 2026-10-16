@@ -466,7 +466,7 @@ async def improve_session_local(
     reported as ``unsupported`` — there is no client-side fallback (the old
     persist path re-cognified the whole session cache on every run).
     ``trigger`` names the caller and is recorded with the session's improve
-    state on success, for the idle/auto cooldown.
+    state on success, for the auto cooldown.
 
     Serialized per session by ``improve_session_lock``, matching the HTTP path in
     ``run_session_improve``. ``store-to-session``'s background fire takes no outer

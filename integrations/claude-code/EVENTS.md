@@ -35,6 +35,7 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `exit-watcher:pidfile_unlink_failed` | `exit_watcher.pidfile_unlink_failed` |
 | `exit-watcher:pidfile_write_failed` | `exit_watcher.pidfile_write_failed` |
 | `exit-watcher:started` | `exit_watcher.started` |
+| `hook:users_me_lookup_failed` | `config.users_me_lookup_failed` |
 | `hook:activity_log_write_failed` | `activity.log_write_failed` |
 | `hook:activity_touch_failed` | `activity.touch_failed` |
 | `hook:agent_lifecycle_error` | `agent.lifecycle_error` |
@@ -51,6 +52,7 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:auto_improve_throttled` | `auto.improve_throttled` |
 | `hook:base_url_changed_mid_session` | `endpoint.base_url_changed_mid_session` |
 | `hook:base_url_notice_failed` | `endpoint.base_url_notice_failed` |
+| `hook:final_sync_once_released` | `sync.sync_once_released` |
 | `hook:hook_notice_failed` | `notice.failed` |
 | `hook:boot_refused_server_present` | `boot.refused_server_present` |
 | `hook:bootstrap_complete` | `bootstrap.complete` |
@@ -152,6 +154,8 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:invalid_payload_json` | `io.payload_json` |
 | `hook:json_load_failed` | `json.load_failed` |
 | `hook:json_write_failed` | `json.write_failed` |
+| `hook:phase_begin_failed` | `phase.write_failed` |
+| `hook:phase_end_failed` | `phase.write_failed` |
 | `hook:last_recall_write_failed` | `last.recall_write_failed` |
 | `hook:launch_dataset_ids_skipped` | `launch.dataset_ids_skipped` |
 | `hook:legacy_config_json_removed` | `legacy.config_json_removed` |
@@ -164,6 +168,9 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:managed_endpoint_boot_refused` | `boot.refused_managed_endpoint` |
 | `hook:managed_endpoint_down` | `endpoint.managed_down` |
 | `hook:map_create_failed` | `map.create_failed` |
+| `hook:memory_credit` | `memory.credit` |
+| `hook:memory_credit_failed` | `memory.credit_failed` |
+| `hook:memory_tags_write_failed` | `memory.tags_write_failed` |
 | `hook:missing_payload_session_id` | `missing.payload_session_id` |
 | `hook:mode_decision` | `runtime.decision` |
 | `hook:no_session_id` | `session.session_id` |
@@ -207,6 +214,7 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:recall_auth_rejected` | `recall.auth_rejected` |
 | `hook:recall_breaker_open` | `recall.breaker_open` |
 | `hook:recall_budget_exceeded` | `recall.budget_exceeded` |
+| `hook:recall_budget_reduced` | `recall.budget_reduced` |
 | `hook:recall_dataset_hint` | `recall.dataset_hint` |
 | `hook:recall_context_unparsed` | `recall.context_unparsed` |
 | `hook:recall_context_trimmed` | `recall.context_trimmed` |
@@ -239,6 +247,7 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:session_marker_write_failed` | `session.marker_write_failed` |
 | `hook:session_resolved` | `session.resolved` |
 | `hook:session_start_exception` | `session.start_exception` |
+| `hook:session_stats_failed` | `session.stats_failed` |
 | `hook:shared_memory_agent_select_tenant_failed` | `shared_memory.agent_select_tenant_failed` |
 | `hook:shared_memory_grant_denied` | `shared_memory.grant_denied` |
 | `hook:shared_memory_leave_role_failed` | `shared_memory.leave_role_failed` |
@@ -248,6 +257,7 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:shared_memory_skipped` | `shared_memory.skipped` |
 | `hook:shared_memory_tenant_create_failed` | `shared_memory.tenant_create_failed` |
 | `hook:shared_memory_wired` | `shared_memory.wired` |
+| `hook:bash_capture_decision` | `capture.bash_decision` |
 | `hook:skip_self_cognee_bash` | `skip.self_cognee_bash` |
 | `hook:slow_streak_escalated` | `slow.streak_escalated` |
 | `hook:state_sweep` | `state.sweep` |
@@ -260,6 +270,7 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:store_buffered_warming` | `store.buffered_warming` |
 | `hook:store_missing_session_key` | `store.missing_session_key` |
 | `hook:store_session_key` | `store.session_key` |
+| `hook:stored_seq_write_failed` | `save.stored_seq_write_failed` |
 | `hook:switch_aborted_handle_cleanup` | `switch.aborted_handle_cleanup` |
 | `hook:switch_aborted_handle_cleanup_failed` | `switch.aborted_handle_cleanup_failed` |
 | `hook:switch_crashed` | `switch.crashed` |
@@ -279,6 +290,8 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `hook:sync_failed` | `sync.failed` |
 | `hook:sync_missing_session_key` | `sync.missing_session_key` |
 | `hook:sync_no_target_sessions` | `sync.no_target_sessions` |
+| `hook:sync_notice_failed` | `sync.notice_failed` |
+| `hook:sync_notice_shown` | `sync.notice_shown` |
 | `hook:sync_payload` | `sync.payload` |
 | `hook:sync_retry_scheduled` | `sync.retry_scheduled` |
 | `hook:sync_session_key` | `sync.session_key` |
@@ -347,3 +360,29 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `idle-watcher:stopfile_unlink_failed` | `idle_watcher.stopfile_unlink_failed` |
 | `idle-watcher:throttle_check_failed` | `idle_watcher.throttle_check_failed` |
 | `idle-watcher:update_check_error` | `idle_watcher.update_check_error` |
+
+## Cloud queues and context
+
+- `cloud.auto_memory_setup_failed`: auto memory setup failed.
+- `cloud.injection_ledger_failed`: injection ledger failed.
+- `cloud.capture_spooled`: capture spooled.
+- `cloud.cloud_work_expired`: cloud work expired.
+- `cloud.cloud_work_retry`: cloud work retry.
+- `cloud.cloud_capture_delivered`: cloud capture delivered.
+- `cloud.cloud_worker_error`: cloud worker error.
+- `cloud.cloud_capture_rejected`: the server permanently rejected a queued capture (400/413/422); it was expired so the queue keeps moving.
+- `cloud.cloud_worker_idle_exit`: the worker exited with no queued work and no session active for 30 minutes; the next hook restarts it.
+- `cloud.cloud_delivery_bookkeeping_failed`: a capture was delivered but updating counters or queuing the follow-up improve failed; the event is not re-sent.
+- `cloud.context_digest_inject_failed`: startup digest skipped because its cache could not be read.
+- `cloud.context_cache_refresh_failed`: a digest refresh failed; it is retried with exponential backoff and the last good digest stays in use.
+- `cloud.context_cache_refresh_dropped`: a pending digest refresh was removed (another account, older than the cache TTL, or too many failed attempts).
+
+- `capture.trace_skipped_low_signal`: cloud trace omitted as low signal; counted in stats.
+
+`recall.injection_receipt_failed`: writing the body-free last-turn injection receipt failed; recall output remains available.
+
+Bash capture decisions contain only host session identity and `captured`,
+`skipped_self` or `skipped_low_signal`. Captured means retained for the write path,
+not server acknowledgement. Self skips log an allowlisted `first_token` and
+`plugin_path`, `plugin_script` or `cognee_cli` reason. Low-signal skips log the tool
+and allowlisted first token; neither event includes command text.

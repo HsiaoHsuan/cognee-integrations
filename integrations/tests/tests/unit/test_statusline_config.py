@@ -1,7 +1,10 @@
-"""Tests for `_ensure_statusline_configured` (session-start.py) — the one-time
-write of the `statusLine` entry into the host's `~/.claude/settings.json`.
+"""Tests for `_ensure_statusline_configured` (session-start.py) — the write of
+the `statusLine` entry into the host's `~/.claude/settings.json`.
 
-The rule is that the plugin owns exactly what it wrote and nothing else:
+One row, whichever can be drawn: in a session whose row the hooks module draws
+above the prompt (its `band/<session>.json` marker exists) the settings file is
+left alone; otherwise the line below the prompt is installed. Beyond that, the
+plugin owns exactly what it wrote and nothing else:
   * absent entry → write ours;
   * anything the user put there (dict, bare string, a similarly-named command, or
     a cognee mention outside the command itself) → left untouched;
@@ -125,3 +128,42 @@ def test_statusline_setup_can_be_disabled_by_env(ss, settings, monkeypatch):
     monkeypatch.setenv("COGNEE_STATUSLINE", "false")
     ss._ensure_statusline_configured()
     assert not settings.exists()
+
+
+# ── the gate: the module's row or the line, never both, never neither ────────
+
+SESSION = "11111111-2222-4333-8444-555555555555"
+
+
+def _mark_band(temp_home, session=SESSION):
+    """What the hooks module writes at a session start it runs in."""
+    band = temp_home / ".cognee-plugin" / "claude-code" / "band"
+    band.mkdir(parents=True, exist_ok=True)
+    (band / f"{session}.json").write_text(json.dumps({"session_id": session}), encoding="utf-8")
+
+
+def test_nothing_is_written_for_a_session_the_module_draws(ss, settings, temp_home):
+    _mark_band(temp_home)
+    ss._ensure_statusline_configured(SESSION)
+    assert not settings.exists()
+
+
+def test_an_existing_entry_is_left_alone_for_a_session_the_module_draws(ss, settings, temp_home):
+    _mark_band(temp_home)
+    stale = {"type": "command", "command": "/old/cognee-statusline.sh"}
+    _write(settings, {"statusLine": stale})
+    ss._ensure_statusline_configured(SESSION)
+    assert _status_line(settings) == stale
+
+
+def test_the_line_is_installed_for_a_session_the_module_does_not_draw(ss, settings, temp_home):
+    """Another session's marker (the Desktop app) says nothing about this one:
+    an older CLI or a --safe-mode launch on the same machine keeps its line."""
+    _mark_band(temp_home, session="other-session")
+    ss._ensure_statusline_configured(SESSION)
+    assert "cognee-statusline.sh" in _status_line(settings)["command"]
+
+
+def test_the_line_is_installed_when_no_session_id_is_known(ss, settings):
+    ss._ensure_statusline_configured("")
+    assert "cognee-statusline.sh" in _status_line(settings)["command"]

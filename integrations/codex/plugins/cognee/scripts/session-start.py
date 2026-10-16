@@ -145,7 +145,7 @@ _HOST_PYTHON_CANDIDATES = (
 # refusal reaches the user as a systemMessage (the worker that hits it runs
 # detached, with nothing it prints visible). Cleared once a venv is ready.
 _HOST_PYTHON_MARKER = _GLOBAL_STATE_DIR / "host-python-unsupported.json"
-_PINNED_COGNEE_VERSION = "1.6.1"
+_PINNED_COGNEE_VERSION = "1.6.3"
 _INSTALL_TIMEOUT_SECONDS = float(os.environ.get("COGNEE_INSTALL_TIMEOUT", "") or 600.0)
 
 # Maps a configured backend provider env var to the cognee package "extra" that
@@ -350,7 +350,7 @@ def _venv_cognee_version() -> str:
 
 
 # One distribution per extra whose presence in the venv proves that extra's
-# drivers are installed (verified against cognee 1.6.1's optional-dependencies:
+# drivers are installed (verified against cognee 1.6.3's optional-dependencies:
 # fastembed and codegraph are empty extras there, their packages being core).
 # Probing the venv is deliberately preferred over recording installed extras in
 # venv-ready.json: that marker is shared with plugins that don't know about
@@ -2063,9 +2063,8 @@ async def _start(payload: dict | None = None) -> dict:
     # an immediate improve on startup.
     touch_activity()
 
-    # Launch the idle watcher (syncs session memory to graph after the agent
-    # goes idle). Runs in both local-server and cloud modes — the watcher picks
-    # the HTTP or local sync path itself. COGNEE_IDLE_DISABLED opts out.
+    # Launch the idle watcher (update and LLM-key checks, periodic shared-memory
+    # refresh). COGNEE_IDLE_DISABLED opts out.
     if os.environ.get("COGNEE_IDLE_DISABLED", "").lower() not in (
         "1",
         "true",
@@ -2128,6 +2127,50 @@ def _update_nudge_suffix() -> str:
     )
 
 
+def _apply_sync_notice(output: dict, payload: dict | None = None) -> dict:
+    """Say, on reopening a chat, whether it reached long-term memory (SDK-1071).
+
+    The session-end sync runs after the chat is gone, so its outcome is shown
+    when the same chat is resumed: resume keeps the session id, and the
+    session's improve record says when it was last sent or why the send
+    failed. Shown once per sync, in the terminal and to the agent, and only on
+    resume: a compaction keeps the session too, but lands mid-task, where an
+    idle or auto sync's notice would only interrupt. Off with
+    ``COGNEE_PLUGIN_CITE_MEMORY=off``.
+    """
+    if str((payload or {}).get("source") or "") != "resume":
+        return output
+    try:
+        import _plugin_common
+        from _recall_text import credit_enabled, mark_notice_shown, notice_due, sync_notice
+        from config import get_session_id
+
+        if not credit_enabled(_plugin_common.CITE_MEMORY_DEFAULT):
+            return output
+        session_id = get_session_id(load_config())
+        message, sync_ts = sync_notice(_plugin_common.read_improve_state(session_id))
+        if not message or not notice_due(_plugin_common._PLUGIN_DIR, session_id, sync_ts):
+            return output
+        mark_notice_shown(_plugin_common._PLUGIN_DIR, session_id, sync_ts)
+    except Exception as exc:
+        hook_log("sync_notice_failed", {"error": str(exc)[:200]})
+        return output
+    hook_log("sync_notice_shown", {"session": session_id, "sync_ts": sync_ts})
+
+    result = dict(output or {})
+    hso = dict(result.get("hookSpecificOutput") or {})
+    hso.setdefault("hookEventName", "SessionStart")
+    for field in ("systemMessage", "additionalContext"):
+        existing = str(hso.get(field) or "").strip()
+        hso[field] = f"{existing}\n\n{message}" if existing else message
+    result["hookSpecificOutput"] = hso
+    # The user sees only the top-level systemMessage: Claude Code documents it
+    # there (inside hookSpecificOutput it reached the agent but was never shown).
+    top = str(result.get("systemMessage") or "").strip()
+    result["systemMessage"] = f"{top}\n\n{message}" if top else message
+    return result
+
+
 def main():
     # First run: leave a commented ~/.cognee/.env template so one-time config
     # has a documented file to land in. Values (if any) were already loaded
@@ -2166,6 +2209,7 @@ def main():
             output = asyncio.run(_start(payload)) or {}
     except Exception as exc:
         hook_log("session_start_exception", {"error": str(exc)[:200]})
+    output = _apply_sync_notice(output, payload)
     output = _apply_host_python_warning(output)
     print(json.dumps(output))
 

@@ -126,3 +126,32 @@ def test_missing_unregister_name_does_not_swallow_strict_error(sync_mod, mock_se
     with pytest.raises(RuntimeError, match="incomplete"):
         asyncio.run(sync_mod._sync(stop_watcher=False, unregister_on_finish=True, strict=True))
     mock_server.assert_not_called("POST", UNREGISTER)
+
+
+def test_cloud_strict_timeout_explains_the_pending_retry(
+    sync_mod, suite, monkeypatch, tmp_path, capsys
+):
+    if suite.name != "claude-code":
+        pytest.skip("Claude cloud worker")
+    import importlib
+    import io
+    import json
+    import sys
+
+    worker = importlib.import_module("_cloud_worker")
+    common = importlib.import_module("_plugin_common")
+    path = tmp_path / "wanted.json"
+    path.write_text(json.dumps({"last_error": "busy", "next_attempt": 1005}))
+    monkeypatch.setattr(worker, "enabled", lambda *_: True)
+    monkeypatch.setattr(worker, "request_improve", lambda *_: path)
+    monkeypatch.setattr(common, "load_resolved", lambda **_: {"session_id": "sid", "dataset": "ds"})
+    monkeypatch.setattr(common, "get_session_key", lambda: "host")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setattr(sys, "argv", ["sync-session-to-graph.py", "--strict"])
+    ticks = iter([0, 841])
+    monkeypatch.setattr(sync_mod.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(sync_mod.time, "time", lambda: 1000)
+    with pytest.raises(SystemExit) as exc:
+        sync_mod.main()
+    assert exc.value.code == 1
+    assert "Last result: busy; next retry in 5s." in capsys.readouterr().err

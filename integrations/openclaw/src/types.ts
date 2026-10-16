@@ -84,6 +84,21 @@ export type CogneePluginConfig = {
    * Requires enableSessions. Default: true.
    */
   captureSession?: boolean;
+  /**
+   * Capture policy, the same rules as the claude-code/codex COGNEE_CAPTURE_*
+   * settings (each unset key falls back to that env var). Tool entries are a
+   * name, an fnmatch glob, or `Tool(prefix:*)` matched against the first word
+   * of a shell command; names match case-insensitively. An entry that cannot
+   * be parsed turns trace capture off until it is fixed (fail closed).
+   */
+  captureTools?: string[];
+  captureDenyTools?: string[];
+  /** Added to the built-in deny list (.env*, *.pem, *.key, ssh/aws credentials, …). */
+  captureDenyPaths?: string[];
+  /** Scrub secrets (keys, tokens, DB URLs, credential assignments) before storing. Default: true. */
+  captureRedact?: boolean;
+  /** Extra regex sources to redact. */
+  captureRedactPatterns?: string[];
 
   // --- Search ---
   searchType?: CogneeSearchType;
@@ -91,7 +106,12 @@ export type CogneePluginConfig = {
   deleteMode?: CogneeDeleteMode;
   maxResults?: number;
   minScore?: number;
+  /** Deprecated, no effect: recall is bounded by recallPassageChars / recallContextChars. */
   maxTokens?: number;
+  /** Cap per recalled passage, cut at a paragraph break. 0 = no cap. Default: COGNEE_RECALL_PASSAGE_CHARS or 2000. */
+  recallPassageChars?: number;
+  /** Cap on everything one prompt injects (graph context, guidance, code facts); each dataset's context drops whole passages from the end to fit, then the total is held to it. 0 = no cap. Default: COGNEE_RECALL_CONTEXT_CHARS or 12000. */
+  recallContextChars?: number;
 
   // --- Recall injection ---
   /** Where recalled memories are injected in the prompt. Default: prependSystemContext */
@@ -104,6 +124,8 @@ export type CogneePluginConfig = {
    * `openclaw cognee index-repo`. Default: true.
    */
   codeSearchTool?: boolean;
+  /** Register the memory_recap tool (standup / digest / timeline of recorded sessions). Default: true. */
+  recapTool?: boolean;
   /**
    * Add a "code" recall lane when a prompt carries an identifier-shaped token
    * and at least one code graph is registered or listed in codeDatasets.
@@ -128,12 +150,8 @@ export type CogneePluginConfig = {
 
   // --- Recall layers ---
   /**
-   * Alongside the knowledge-graph search, recall this conversation's session
-   * layers explicitly — cached Q&A turns ("session"), tool-call lessons
-   * ("trace") and distilled agent guidance ("session_context") — and inject
-   * them as separate sections. Without an explicit scope the server searches
-   * the graph only whenever dataset_ids/search_type are supplied, which they
-   * always are here. Requires enableSessions. Default: true.
+   * Deprecated, no effect. Recall fetches the graph context and this session's
+   * guidance (session_context) itself. Kept so existing configs keep validating.
    */
   recallSessionLayers?: boolean;
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 
 EVENT_NAMES = {
+    "hook:users_me_lookup_failed": "config.users_me_lookup_failed",
+    "hook:trace_skipped_low_signal": "capture.trace_skipped_low_signal",
     "hook:base_url_changed_mid_session": "endpoint.base_url_changed_mid_session",
     "hook:base_url_notice_failed": "endpoint.base_url_notice_failed",
     "hook:hook_notice_failed": "notice.failed",

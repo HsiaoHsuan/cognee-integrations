@@ -60,6 +60,7 @@ def _render_under_encoding(suite, temp_home, io_encoding: str):
     # change what the bar renders.
     env = build_env(suite, temp_home, service_url=None)
     env["PYTHONIOENCODING"] = io_encoding
+    env["COGNEE_STATUSLINE_STYLE"] = "classic"
 
     completed = subprocess.run(
         [sys.executable, str(suite.scripts_dir / "cognee_statusline_render.py")],

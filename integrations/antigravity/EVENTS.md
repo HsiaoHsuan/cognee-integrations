@@ -29,6 +29,7 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `exit-watcher:pidfile_unlink_failed` | `exit_watcher.pidfile_unlink_failed` |
 | `exit-watcher:pidfile_write_failed` | `exit_watcher.pidfile_write_failed` |
 | `exit-watcher:started` | `exit_watcher.started` |
+| `hook:users_me_lookup_failed` | `config.users_me_lookup_failed` |
 | `hook:activity_log_write_failed` | `activity.log_write_failed` |
 | `hook:activity_touch_failed` | `activity.touch_failed` |
 | `hook:agent_lifecycle_error` | `agent.lifecycle_error` |
@@ -347,3 +348,5 @@ Names cover current hooks, configuration, transcript cleanup, and both watchers.
 | `idle-watcher:shared_memory_refreshed` | `idle_watcher.shared_memory_refreshed` |
 | `hook:shared_memory_grant_denied` | `shared_memory.grant_denied` |
 | `hook:plugin_provision_retry_after_update` | `plugin.provision_retry_after_update` |
+
+- `capture.trace_skipped_low_signal`: cloud trace omitted as low signal; counted in stats.

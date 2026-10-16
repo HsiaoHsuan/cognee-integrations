@@ -542,3 +542,40 @@ describe("forget-tool server calls", () => {
     expect(call.json).toEqual({ dataset_id: "ds-1", data_id: "d1" });
   });
 });
+
+describe("cognee 1.6.3 request hygiene", () => {
+  it("never sends a blank node_set entry (cognee >= 1.6.3 answers it with 400)", async () => {
+    await localClient().remember({ files: [{ filePath: "memory/a.md", data: "x" }], datasetName: "ds", nodeSet: ["user_context", "", "  "] });
+    const body = mock.assertCalled("POST", "/remember").body;
+    expect(body.match(/name="node_set"/g)).toHaveLength(1);
+    expect(body).toContain("user_context");
+  });
+
+  it("omits search_type only when the caller leaves it unset (the session_context guidance request)", async () => {
+    await localClient().recall({ queryText: "q", searchPrompt: "", datasetIds: ["ds-1"], scope: ["session_context"], sessionId: "s" });
+    expect(mock.assertCalled("POST", "/recall").json).not.toHaveProperty("search_type");
+  });
+
+  it("surfaces the HTTP status of a failed request", async () => {
+    mock.forceResponse("POST", "/improve", 402, { error: "budget exhausted" });
+    await expect(localClient().improve({ datasetName: "ds" })).rejects.toMatchObject({ name: "CogneeRequestError", status: 402 });
+  });
+});
+
+describe("recap endpoints", () => {
+  it("lists sessions with range and paging, and reads an unknown session as null", async () => {
+    mock.setResponse("GET", "/sessions", { sessions: [], has_more: false });
+    const api = localClient().recapApi();
+    await api.listSessions({ range: "7d", limit: 200, offset: 0 });
+    expect(mock.assertCalled("GET", "/sessions").query).toEqual({ range: "7d", limit: "200", offset: "0" });
+    await expect(api.getSession("open_claw_missing")).resolves.toBeNull();
+  });
+
+  it("reads raw data as text and recalls the graph without a session id", async () => {
+    const api = localClient().recapApi();
+    await api.recallGraph({ query: "deploys", datasetIds: ["ds-1"], topK: 12, timeoutMs: 5_000 });
+    const body = mock.assertCalled("POST", "/recall").json as Record<string, unknown>;
+    expect(body).toMatchObject({ query: "deploys", top_k: 12, scope: ["graph"], only_context: true, dataset_ids: ["ds-1"] });
+    expect(body).not.toHaveProperty("session_id");
+  });
+});

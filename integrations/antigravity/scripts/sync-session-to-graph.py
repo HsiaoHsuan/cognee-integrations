@@ -356,7 +356,7 @@ async def _sync(
 
             incomplete: list[str] = []
             # The final (strict) sync must always run; a manual /cognee-sync too.
-            # Only the idle and auto triggers honour the improve cooldown.
+            # Only the auto trigger honours the improve cooldown.
             trigger = "auto" if automatic else ("final" if strict else "manual")
             if api_mode:
                 for sid, ds in targets:

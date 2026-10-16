@@ -1,6 +1,15 @@
 ---
 name: cognee-digest
-description: A multi-day digest of the user's own coding-agent sessions — sessions per day and project, most-edited files, and every lesson Cognee distilled into the knowledge graph in that window. Use only when the user explicitly asks for a weekly digest, a retro, a recap or report of their recent sessions, or invokes /cognee-digest. Not for questions about code or the current task.
+description: >-
+  A digest of a week or more of the user's own coding-agent sessions (default 7 days):
+  sessions per day and project, most-edited files and the lessons Cognee learned,
+  written up as shipped, decided and still open.
+when_to_use: >-
+  E.g. "weekly digest", "recap my week", "prep my retro", "what did I get done this
+  week?", "what did we ship and decide this week?", "what did Cognee learn this month?".
+  Not for yesterday, today or a standup (cognee-standup), one topic's history
+  (cognee-timeline), Cognee's own stats (cognee-report), a doc for others, or setting up
+  a recurring run.
 ---
 
 # Cognee Digest

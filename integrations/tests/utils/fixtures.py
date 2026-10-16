@@ -137,6 +137,7 @@ def statusline(suite, isolated_modules, monkeypatch):
     marker files at the module's own constants. COGNEE_BASE_URL is left unset
     (local mode) unless a test sets it.
     """
+    monkeypatch.setenv("COGNEE_STATUSLINE_STYLE", "classic")
     return isolated_modules(suite, "cognee_statusline_render")
 
 

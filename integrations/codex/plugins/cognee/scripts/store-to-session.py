@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 import urllib.error
 
 # Add scripts dir to path for helper imports
@@ -57,10 +58,10 @@ async def _fire_improve_background(dataset: str, session_id: str, reason: str) -
     """Fire-and-forget session improve; failures are logged but never raised.
 
     The server bridges the session itself from its session cache (improve);
-    see run_session_improve_detailed. Shares the cooldown / backoff gate with the
-    idle watcher; the session-end sync ignores it and covers whatever a skip
-    here leaves behind. Without server auth there is nothing to submit to —
-    the session-end sync picks the session up once a key is available.
+    see run_session_improve_detailed. Honours the cooldown / backoff gate; the
+    session-end sync ignores it and covers whatever a skip here leaves behind.
+    Without server auth there is nothing to submit to — the session-end sync
+    picks the session up once a key is available.
     """
     throttled = improve_throttle_reason(session_id)
     if throttled:
@@ -117,6 +118,11 @@ def _infer_status(payload: dict) -> tuple[str, str]:
         if response.get("is_error") or response.get("error"):
             err = response.get("error") or response.get("message") or "Tool reported an error."
             return "error", _truncate_str(err, 500)
+        if response.get("interrupted"):
+            return "error", "Tool interrupted."
+        exit_code = response.get("exit_code", response.get("exitCode", 0))
+        if exit_code not in (0, "0", None):
+            return "error", "Tool exited with code %s." % exit_code
     if isinstance(payload.get("error"), str) and payload["error"]:
         return "error", _truncate_str(payload["error"], 500)
     return "success", ""
@@ -142,7 +148,14 @@ async def _store_tool_call(payload: dict) -> None:
     tool_name = payload.get("tool_name", "unknown")
     tool_input = payload.get("tool_input") or {}
     tool_output = payload.get("tool_output") or payload.get("tool_response") or ""
-    from _capture_policy import CapturePatternError, allow_tool, redact
+    from _capture_policy import (
+        CapturePatternError,
+        allow_tool,
+        is_plugin_invocation,
+        low_signal_bash,
+        redact,
+        safe_first_token,
+    )
 
     try:
         allowed = allow_tool(tool_name, tool_input)
@@ -158,17 +171,21 @@ async def _store_tool_call(payload: dict) -> None:
     tool_output = redact(tool_output)
     payload = redact(payload)
 
-    # Suppress self-reference: any Bash call that mentions 'cognee' is
-    # likely the plugin/CLI talking to itself and would recurse.
-    if tool_name == "Bash":
-        cmd = ""
-        if isinstance(tool_input, dict):
-            cmd = str(tool_input.get("command", ""))
-        if "cognee" in cmd:
-            hook_log("skip_self_cognee_bash", {"cmd_prefix": cmd[:80]})
-            return
-
+    command = str(tool_input.get("command", "")) if isinstance(tool_input, dict) else ""
     status, error_message = _infer_status(payload)
+    reason = is_plugin_invocation(command) if tool_name == "Bash" else ""
+    low_signal = tool_name == "Bash" and low_signal_bash(command, tool_output, status)
+    if reason:
+        hook_log(
+            "skip_self_cognee_bash", {"first_token": safe_first_token(command), "reason": reason}
+        )
+        return
+    if low_signal:
+        hook_log(
+            "trace_skipped_low_signal",
+            {"tool": tool_name, "first_token": safe_first_token(command)},
+        )
+        return
 
     # Normalize method_params: small structured dict is ideal; fall back
     # to a truncated-string dict if we got something non-JSON-safe.
@@ -274,6 +291,33 @@ async def _store_tool_call(payload: dict) -> None:
             await _fire_improve_background(dataset, session_id, reason=f"turn_{count}")
     else:
         hook_log("trace_store_noresult", {"tool": tool_name})
+
+
+def _check_memory_credit(payload: dict) -> None:
+    """Check the answer's Cognee credits against the session's tags (SDK-1071).
+
+    The recall hook tags each injected item ``m1``, ``m2``… and keeps a
+    memory's tag for the whole session. A cited tag the session handed out is
+    a valid credit (``earlier`` when it was not injected on this turn); one it
+    never handed out is invented. Both go to the log, which measures how
+    reliably agents credit memory, and the first valid credit switches off the
+    longer first-credit wording for the rest of the session. Local only:
+    nothing is sent anywhere.
+    """
+    import _plugin_common
+    from _recall_text import MemoryTags, check_credits, credit_enabled, record_credit
+
+    if not credit_enabled(_plugin_common.CITE_MEMORY_DEFAULT):
+        return
+    msg = str(payload.get("assistant_message") or payload.get("last_assistant_message") or "")
+    if not msg or msg == "null":
+        return
+    key = get_session_key()
+    result = check_credits(msg, MemoryTags.load(_plugin_common._PLUGIN_DIR, key))
+    if not result["cited"] and not result["available"]:
+        return  # nothing injected, nothing cited: not a turn that could credit
+    record_credit(_plugin_common._PLUGIN_DIR, key, result, ts=str(int(time.time())))
+    hook_log("memory_credit", result)
 
 
 async def _store_assistant_stop(payload: dict) -> None:
@@ -434,6 +478,10 @@ def main():
     try:
         with quiet_hook_output("store-to-session"):
             if is_stop:
+                try:
+                    _check_memory_credit(payload)
+                except Exception as exc:
+                    hook_log("memory_credit_failed", {"error": str(exc)[:200]})
                 asyncio.run(_store_assistant_stop(payload))
                 # End-of-turn code-graph freshness: independent of whether an
                 # assistant message was stored (edits happen either way).

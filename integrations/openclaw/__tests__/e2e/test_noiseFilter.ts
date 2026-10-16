@@ -47,6 +47,10 @@ jest.mock("../../src/persistence", () => ({
 }));
 
 const mockRecall = jest.fn(async (_params: unknown): Promise<unknown[]> => []);
+/** The graph-scope recalls (each prompt also sends one session_context recall for guidance). */
+function graphRecalls(): unknown[] {
+  return mockRecall.mock.calls.map((c) => c[0] as { scope?: string[] }).filter((p) => p.scope?.includes("graph"));
+}
 const mockRememberEntry = jest.fn(async (_params: unknown): Promise<{ entryId?: string }> => ({ entryId: "e1" }));
 const mockRegisterAgent = jest.fn(async (_params: unknown) => ({ ok: true, connectionId: "c1" }));
 
@@ -159,8 +163,8 @@ describe("harness-noise filtering", () => {
     await emit("llm_output", { assistantTexts: ["we ship on Friday"] }, ctx);
     await flush();
 
-    // One graph-scope recall per prompt (the session layers ride in its text).
-    expect(mockRecall).toHaveBeenCalledTimes(1);
+    // One graph recall plus the session-guidance recall per prompt.
+    expect(graphRecalls()).toHaveLength(1);
     const qas = qaCalls();
     expect(qas).toHaveLength(1);
     expect(qas[0]).toMatchObject({
@@ -190,7 +194,7 @@ describe("harness-noise filtering", () => {
     await emit("llm_output", { assistantTexts: ["HEARTBEAT_OK"] }, ctx);
     await flush();
 
-    expect(mockRecall).toHaveBeenCalledTimes(1); // the single graph-scope recall
+    expect(graphRecalls()).toHaveLength(1);
     expect(qaCalls()).toHaveLength(1);
   });
 
@@ -207,6 +211,6 @@ describe("harness-noise filtering", () => {
     // heartbeat runs in this configuration.
     await emit("before_prompt_build", { prompt: HEARTBEAT_PROMPT }, { ...ctx, sessionId: "s2" });
     await flush();
-    expect(mockRecall).toHaveBeenCalledTimes(1); // the single graph-scope recall
+    expect(graphRecalls()).toHaveLength(1);
   });
 });

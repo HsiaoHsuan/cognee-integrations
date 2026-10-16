@@ -29,6 +29,8 @@ from _plugin_common import (
     http_api_ready,
     is_observer_child,
     load_resolved,
+    phase_begin,
+    phase_end,
     resolve_session_key_from_payload,
     resolved_http_endpoint_auth,
     run_session_improve_detailed,
@@ -92,14 +94,31 @@ def _spawn_detached_sync() -> bool:
 
 
 def _final_sync_identity() -> tuple[str, str]:
-    """Return a stable per-session token for detached final sync dedupe."""
+    """Return the dedupe token for this session end: the session plus how much it stored.
+
+    One exit can start two final-sync workers (the SessionEnd hook and the exit
+    watcher); both see the same token, so only one submits. The stored-item
+    count makes a later exit after new turns a new token, so resuming a chat
+    and leaving it again syncs the new turns instead of being skipped until
+    the marker expires (SDK-1071). An exit with nothing new keeps the token and
+    is skipped.
+    """
+    from _plugin_common import get_session_key, read_stored_seq
+
     session_key = str(os.environ.get("COGNEE_SESSION_KEY", "") or "").strip()
-    if session_key:
-        return session_key, "COGNEE_SESSION_KEY"
     session_id = str(os.environ.get("COGNEE_SYNC_SESSION_ID", "") or "").strip()
-    if session_id:
-        return session_id, "COGNEE_SYNC_SESSION_ID"
-    return "", "missing"
+    if session_key:
+        token, source = session_key, "COGNEE_SESSION_KEY"
+    elif session_id:
+        token, source = session_id, "COGNEE_SYNC_SESSION_ID"
+    else:
+        return "", "missing"
+    # The store hooks count under the sanitized session key (see bump_save_counter).
+    return f"{token}:{read_stored_seq(get_session_key() or session_id)}", source
+
+
+#: The marker this worker claimed, released again if every attempt fails.
+_CLAIMED_MARKER: Path | None = None
 
 
 def _claim_final_sync_once() -> bool:
@@ -120,6 +139,8 @@ def _claim_final_sync_once() -> bool:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(token)
         hook_log("final_sync_once_claimed", {"source": source, "marker": str(marker)})
+        global _CLAIMED_MARKER
+        _CLAIMED_MARKER = marker
         return True
     except FileExistsError:
         hook_log("final_sync_once_already_claimed", {"source": source, "marker": str(marker)})
@@ -294,6 +315,7 @@ async def _sync(
         _load_resolved()
     )
     targets = _sync_targets(session_id, dataset, session_key, include_touched)
+    phase_begin("syncing", session_key=session_key)
     hook_log(
         "sync_start",
         {
@@ -305,6 +327,7 @@ async def _sync(
         },
     )
 
+    ok = False
     try:
         if stop_watcher:
             _stop_idle_watcher()
@@ -312,6 +335,7 @@ async def _sync(
 
         if not targets:
             hook_log("sync_no_target_sessions", {"dataset": dataset})
+            ok = True  # nothing to sync is not a failed sync
             return
 
         if not http_api_ready():
@@ -326,15 +350,15 @@ async def _sync(
 
         incomplete: list[str] = []
         # The final (strict) sync must always run; a manual /cognee-sync too.
-        # Only the idle and auto triggers honour the improve cooldown/backoff.
+        # Only the auto trigger honours the improve cooldown/backoff.
         trigger = "final" if strict else "manual"
         for sid, ds in targets:
             outcome = run_session_improve_detailed(ds, sid, trigger=trigger)
             wrote = bool(outcome.get("ok"))
             why = str(outcome.get("reason") or "")
             if why == "busy":
-                # Another improve of this session is in flight server-side (the
-                # idle watcher's, or a second final worker). It persists
+                # Another improve of this session is in flight server-side (an
+                # auto improve, or a second final worker). It persists
                 # everything above the session watermark, and re-submitting
                 # would only be recorded as one more improve operation — so a
                 # busy answer is deferred, never retried.
@@ -364,7 +388,11 @@ async def _sync(
             # drain+improve, not silently report success. A busy answer is not
             # in this list on purpose.
             raise RuntimeError(f"final session sync incomplete for: {', '.join(incomplete)}")
+        ok = not incomplete
     finally:
+        # ``ok`` is still False after a raise above: the row then says the
+        # sync failed instead of ticking it.
+        phase_end("syncing", session_key=session_key, ok=ok)
         if unregister_on_finish:
             if not (was_registered or has_api_key):
                 hook_log(
@@ -421,6 +449,56 @@ def main():
         },
     )
 
+    from _cloud_worker import enabled as cloud_enabled
+    from _cloud_worker import request_improve
+
+    if cloud_enabled():
+        from _plugin_common import get_session_key, load_resolved, touched_pairs
+        from _session_stats import update as update_stats
+
+        resolved = load_resolved(identity=False)
+        key = get_session_key()
+        requested_at = time.time()
+        pairs = [
+            (
+                os.environ.get("COGNEE_SYNC_SESSION_ID") or resolved.get("session_id"),
+                os.environ.get("COGNEE_SYNC_DATASET") or resolved.get("dataset"),
+            )
+        ]
+        if is_session_end or detached_final:
+            pairs.extend((p["session_id"], p["dataset"]) for p in touched_pairs(key))
+            update_stats(key, metadata={"ended_at": time.time()})
+        pending_paths = []
+        for sid, dataset in pairs:
+            if sid and dataset:
+                pending_paths.append(
+                    request_improve(
+                        dataset, sid, "final" if is_session_end or detached_final else "manual"
+                    )
+                )
+        if _STRICT_ARG in sys.argv:
+            from _cloud_worker import improve_wait_detail, read, session_dir
+
+            deadline = time.monotonic() + 840
+            while time.monotonic() < deadline:
+                result = read(session_dir(key) / "last-improve.json")
+                if (
+                    result.get("ok")
+                    and result.get("session_id") == pairs[0][0]
+                    and result.get("at", 0) >= requested_at
+                ):
+                    return
+                time.sleep(0.2)
+            detail = (
+                improve_wait_detail(pending_paths[0]) if pending_paths else "No target session."
+            )
+            print(
+                "Cognee sync is still queued; the dataset was not switched. " + detail,
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        return
+
     if detached_final:
         delay_raw = os.environ.get("COGNEE_SYNC_START_DELAY", "")
         try:
@@ -442,6 +520,10 @@ def main():
     # slash-command invocations happen mid-session, and killing the watcher
     # there prevents later idle persistence.
     if is_session_end:
+        from _plugin_common import get_session_key
+        from _session_stats import update as update_stats
+
+        update_stats(get_session_key(), metadata={"ended_at": time.time()})
         _stop_idle_watcher()
         spawned = _spawn_detached_sync()
         hook_log("sync_deferred_to_shutdown_worker", {"spawned": spawned})
@@ -487,6 +569,14 @@ def main():
             if attempt < attempts:
                 hook_log("sync_retry_scheduled", {"attempt": attempt + 1, "delay": retry_delay})
                 time.sleep(retry_delay)
+    if detached_final and last_error is not None and _CLAIMED_MARKER is not None:
+        # Every attempt failed: drop the claim so the next exit of this session
+        # tries again instead of being skipped as already synced.
+        try:
+            _CLAIMED_MARKER.unlink()
+            hook_log("final_sync_once_released", {"marker": str(_CLAIMED_MARKER)})
+        except OSError:
+            pass
     if strict_cli and last_error is not None:
         sys.exit(1)
 

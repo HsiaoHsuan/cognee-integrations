@@ -206,3 +206,21 @@ describe("gateway anchor", () => {
     expect(harness.logger.warn).toHaveBeenCalledWith(expect.stringMatching(/unregister failed/i));
   });
 });
+
+describe("user dataset without a user id", () => {
+  it("warns at gateway start that userDatasetPrefix falls back to one shared dataset", async () => {
+    const harness = createPluginApi(plugin, { userDatasetPrefix: "people" });
+    await harness.emit("gateway_start", {}, {});
+    await flush();
+    const warn = (harness.api.logger as { warn: jest.Mock }).warn;
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('falls back to "people-default"'));
+  });
+
+  it("stays quiet when userId is set", async () => {
+    const harness = createPluginApi(plugin, { userDatasetPrefix: "people", userId: "ana" });
+    await harness.emit("gateway_start", {}, {});
+    await flush();
+    const warn = (harness.api.logger as { warn: jest.Mock }).warn;
+    expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("userDatasetPrefix"));
+  });
+});

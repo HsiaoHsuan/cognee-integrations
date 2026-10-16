@@ -8,7 +8,8 @@
       "memory_get",
       "memory_forget",
       "memory_switch_dataset",
-      "memory_code_search"
+      "memory_code_search",
+      "memory_recap"
     ]
   },
   "toolMetadata": {
@@ -22,6 +23,10 @@
       "optional": true
     },
     "memory_code_search": {
+      "optional": true,
+      "replaySafe": true
+    },
+    "memory_recap": {
       "optional": true,
       "replaySafe": true
     }
@@ -152,6 +157,30 @@
         "type": "boolean",
         "description": "Capture each tool call as a trace entry and each prompt/answer pair as a QA entry in Cognee's session cache (default: true; requires enableSessions)"
       },
+      "captureTools": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Tools whose calls are captured: names, fnmatch globs, or Tool(prefix:*) matched against a shell command's first word; case-insensitive (default: COGNEE_CAPTURE_TOOLS, else all)"
+      },
+      "captureDenyTools": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Tools never captured, same pattern forms as captureTools (default: COGNEE_CAPTURE_DENY_TOOLS, else none)"
+      },
+      "captureDenyPaths": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Extra file globs whose tool calls are never captured, added to the built-in list (.env*, *.pem, *.key, ssh and cloud credentials, secrets.*, credentials.*) (default: COGNEE_CAPTURE_DENY_PATHS)"
+      },
+      "captureRedact": {
+        "type": "boolean",
+        "description": "Scrub secrets (private keys, tokens, DB URLs, credential assignments, vendor keys) from captured prompts, answers and tool calls (default: COGNEE_CAPTURE_REDACT, else true)"
+      },
+      "captureRedactPatterns": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Extra regular expressions whose matches are redacted (default: COGNEE_CAPTURE_REDACT_PATTERNS)"
+      },
       "searchType": {
         "type": "string",
         "enum": [
@@ -191,7 +220,17 @@
       },
       "maxTokens": {
         "type": "number",
-        "description": "Token cap for recall per scope (default: 512)"
+        "description": "Deprecated, no effect: recall is bounded by recallPassageChars and recallContextChars. Kept so existing configs keep validating"
+      },
+      "recallPassageChars": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Cap per recalled passage, cut at a paragraph break; 0 disables (default: COGNEE_RECALL_PASSAGE_CHARS, else 2000)"
+      },
+      "recallContextChars": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Cap on everything one prompt injects (graph context, guidance, code facts); each dataset's context drops whole passages from the end to fit, and the block that crosses the total is cut and marked; 0 disables (default: COGNEE_RECALL_CONTEXT_CHARS, else 12000)"
       },
       "recallInjectionPosition": {
         "type": "string",
@@ -205,6 +244,10 @@
       "codeSearchTool": {
         "type": "boolean",
         "description": "Register the memory_code_search agent tool for deterministic structural queries against repositories indexed with `openclaw cognee index-repo` (default: true)"
+      },
+      "recapTool": {
+        "type": "boolean",
+        "description": "Register the memory_recap agent tool: a standup, digest or topic timeline built from the sessions Cognee recorded (default: true)"
       },
       "codeGraphRecall": {
         "type": "boolean",
@@ -225,7 +268,7 @@
       },
       "recallSessionLayers": {
         "type": "boolean",
-        "description": "Deprecated, no effect: since cognee 1.6.0 the single graph recall already carries this conversation's history and guidance in its text. Kept so existing configs keep validating"
+        "description": "Deprecated, no effect: recall fetches the graph context and this session's guidance itself. Kept so existing configs keep validating"
       },
       "memoryTools": {
         "type": "boolean",
@@ -283,11 +326,11 @@
       },
       "recallTimeoutMs": {
         "type": "number",
-        "description": "Per recall HTTP call timeout on the prompt path, no retries (default: 2500)"
+        "description": "Per recall HTTP call timeout on the prompt path, no retries (default: 20000)"
       },
       "recallBudgetMs": {
         "type": "number",
-        "description": "Overall wall-clock budget for the recall step per prompt; when exceeded the turn proceeds without memories (default: 4000)"
+        "description": "Overall wall-clock budget for the recall step per prompt; when exceeded the turn proceeds without memories (default: 20000)"
       },
       "recallBreakerThreshold": {
         "type": "number",
@@ -378,6 +421,21 @@
     "captureSession": {
       "label": "Capture Session"
     },
+    "captureTools": {
+      "label": "Captured Tools"
+    },
+    "captureDenyTools": {
+      "label": "Never-Captured Tools"
+    },
+    "captureDenyPaths": {
+      "label": "Never-Captured Paths"
+    },
+    "captureRedact": {
+      "label": "Redact Secrets"
+    },
+    "captureRedactPatterns": {
+      "label": "Extra Redaction Patterns"
+    },
     "searchType": {
       "label": "Search Type",
       "placeholder": "HYBRID_COMPLETION"
@@ -395,8 +453,16 @@
       "placeholder": "0"
     },
     "maxTokens": {
-      "label": "Max Tokens",
+      "label": "Max Tokens (deprecated)",
       "placeholder": "512"
+    },
+    "recallPassageChars": {
+      "label": "Recall Passage Cap (chars)",
+      "placeholder": "2000"
+    },
+    "recallContextChars": {
+      "label": "Recall Context Cap (chars)",
+      "placeholder": "12000"
     },
     "recallInjectionPosition": {
       "label": "Recall Injection Position",
@@ -410,6 +476,9 @@
     },
     "codeSearchTool": {
       "label": "Code Search Tool (memory_code_search)"
+    },
+    "recapTool": {
+      "label": "Recap Tool (memory_recap)"
     },
     "codeGraphRecall": {
       "label": "Code-Graph Recall Lane"
@@ -474,11 +543,11 @@
     },
     "recallTimeoutMs": {
       "label": "Recall Timeout (ms)",
-      "placeholder": "2500"
+      "placeholder": "20000"
     },
     "recallBudgetMs": {
       "label": "Recall Budget (ms)",
-      "placeholder": "4000"
+      "placeholder": "20000"
     },
     "recallBreakerThreshold": {
       "label": "Recall Breaker Threshold",

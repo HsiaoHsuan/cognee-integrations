@@ -67,8 +67,12 @@ ITEM_GUIDANCE = {"source": "session_context", "content": GUIDANCE_BLOCK, "contex
 
 
 @pytest.fixture
-def lookup(suite, hook_module):
-    return hook_module(suite, "session-context-lookup.py")
+def lookup(suite, hook_module, monkeypatch):
+    # These pin the trimmed text itself; the credit tags woven into it are
+    # covered by test_memory_credit.py.
+    module = hook_module(suite, "session-context-lookup.py")
+    monkeypatch.setenv("COGNEE_PLUGIN_CITE_MEMORY", "off")  # after the harness scrubs COGNEE_*
+    return module
 
 
 def _context(run) -> str:
@@ -79,7 +83,7 @@ def test_only_the_retrieved_context_lands_under_the_memory_heading(lookup, monke
     run = drive_recall(lookup, monkeypatch, prompt=PROMPT, recall={"graph": [ITEM_160]})
 
     context = _context(run)
-    assert "=== Cognee memory ===" in context
+    assert "=== Cognee memory" in context
     assert "[cognee-memory]\n## Relevant" in context, context
     # The question template and its answering instructions never reach the agent.
     assert "The question is:" not in context
@@ -111,7 +115,7 @@ def test_a_pre_160_item_with_bare_content_still_renders(lookup, monkeypatch):
     run = drive_recall(lookup, monkeypatch, recall={"graph": [ITEM_LEGACY]})
 
     context = _context(run)
-    assert "=== Cognee memory ===" in context
+    assert "=== Cognee memory" in context
     assert "[cognee-memory]\nbare context" in context
     assert run.detail("context_lookup_hit")["counts"]["graph_context"] == 1
     assert not run.fired("recall_context_trimmed") and not run.fired("recall_context_unparsed")
@@ -159,7 +163,7 @@ def test_the_guidance_block_is_injected_under_its_own_heading(lookup, monkeypatc
     context = _context(run)
     assert "=== Active agent guidance ===" in context
     assert f"[agent-guidance]\n{GUIDANCE_BLOCK}" in context
-    assert context.index("=== Cognee memory ===") < context.index("=== Active agent guidance ===")
+    assert context.index("=== Cognee memory") < context.index("=== Active agent guidance ===")
     counts = run.detail("context_lookup_hit")["counts"]
     assert counts["graph_context"] == 1 and counts["session_context"] == 1
 

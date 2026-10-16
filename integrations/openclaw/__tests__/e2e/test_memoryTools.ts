@@ -62,20 +62,64 @@ beforeEach(() => {
     health: jest.fn(async () => ({ status: "ok" })),
     listDatasets: jest.fn(async () => [{ id: "ds-1", name: "testds" }]),
     setApiKey: jest.fn(),
+    recapApi: () => mockRecapApi,
   }));
   void serverMock;
+});
+
+const mockRecapApi = {
+  listSessions: jest.fn(async () => ({ sessions: [], has_more: false })),
+  getSession: jest.fn(async () => null),
+  listDatasetData: jest.fn(async () => []),
+  getDataRaw: jest.fn(async () => ""),
+  recallGraph: jest.fn(async () => []),
+};
+
+describe("memory_recap", () => {
+  it("runs a standup over the recorded sessions, framed as data", async () => {
+    const { tools } = createPluginApi(plugin, {});
+    const recap = tools({ agentId: "will", sessionId: "s1" }).find((t) => t.name === "memory_recap")!;
+    const out = (await recap.execute("r", { kind: "standup" })) as { details: { kind: string; markdown: string; error?: string } };
+    expect(out.details.error).toBeUndefined();
+    expect(out.details.kind).toBe("standup");
+    expect(out.details.markdown).toMatch(/data/i);
+    expect(mockRecapApi.listSessions).toHaveBeenCalledWith(expect.objectContaining({ range: expect.any(String) }));
+  });
+
+  it("never lists sessions recorded into another agent's dataset", async () => {
+    const recent = new Date(Date.now() - 60_000).toISOString();
+    mockRecapApi.listSessions.mockResolvedValueOnce({
+      sessions: [
+        { session_id: "open_claw_mine", dataset_id: "ds-1", started_at: recent, last_activity_at: recent },
+        { session_id: "open_claw_theirs", dataset_id: "ds-private-other", started_at: recent, last_activity_at: recent },
+      ],
+      has_more: false,
+    } as never);
+    const { tools } = createPluginApi(plugin, {});
+    const recap = tools({ agentId: "will", sessionId: "s1" }).find((t) => t.name === "memory_recap")!;
+    const out = (await recap.execute("r", { kind: "standup", allSessions: true })) as { details: { markdown: string } };
+    expect(out.details.markdown).not.toContain("open_claw_theirs");
+    expect(mockRecapApi.getSession).not.toHaveBeenCalledWith("open_claw_theirs");
+  });
+
+  it("rejects an unknown kind and a timeline without a topic", async () => {
+    const { tools } = createPluginApi(plugin, {});
+    const recap = tools({ agentId: "will" }).find((t) => t.name === "memory_recap")!;
+    expect(((await recap.execute("r", { kind: "weekly" })) as { details: { error?: string } }).details.error).toMatch(/kind must be/);
+    expect(((await recap.execute("r", { kind: "timeline" })) as { details: { error?: string } }).details.error).toMatch(/topic/);
+  });
 });
 
 describe("tool registration", () => {
   it("registers a factory under all contract names", () => {
     const { registerTool, tools } = createPluginApi(plugin);
     expect(registerTool).toHaveBeenCalledTimes(1);
-    expect(registerTool.mock.calls[0][1]).toEqual({ names: ["memory_search", "memory_get", "memory_forget", "memory_switch_dataset", "memory_code_search"] });
-    expect(tools({ agentId: "will" }).map((t) => t.name)).toEqual(["memory_search", "memory_get", "memory_forget", "memory_switch_dataset", "memory_code_search"]);
+    expect(registerTool.mock.calls[0][1]).toEqual({ names: ["memory_search", "memory_get", "memory_forget", "memory_switch_dataset", "memory_code_search", "memory_recap"] });
+    expect(tools({ agentId: "will" }).map((t) => t.name)).toEqual(["memory_search", "memory_get", "memory_forget", "memory_switch_dataset", "memory_code_search", "memory_recap"]);
   });
 
   it("leaves optional tools out when their flags are false", () => {
-    const { registerTool, tools } = createPluginApi(plugin, { memoryForgetTool: false, datasetSwitchTool: false, codeSearchTool: false });
+    const { registerTool, tools } = createPluginApi(plugin, { memoryForgetTool: false, datasetSwitchTool: false, codeSearchTool: false, recapTool: false });
     expect(registerTool.mock.calls[0][1]).toEqual({ names: ["memory_search", "memory_get"] });
     expect(tools({ agentId: "will" }).map((t) => t.name)).toEqual(["memory_search", "memory_get"]);
   });
@@ -92,7 +136,7 @@ describe("tool registration", () => {
 
   it("declares the same tool names in the manifest contracts", () => {
     const manifest = JSON.parse(readFileSync(join(__dirname, "..", "..", "openclaw.plugin.json"), "utf-8"));
-    expect(manifest.contracts.tools.sort()).toEqual(["memory_code_search", "memory_forget", "memory_get", "memory_search", "memory_switch_dataset"]);
+    expect(manifest.contracts.tools.sort()).toEqual(["memory_code_search", "memory_forget", "memory_get", "memory_recap", "memory_search", "memory_switch_dataset"]);
     expect(manifest.configSchema.properties.codeSearchTool.type).toBe("boolean");
     expect(manifest.configSchema.properties.memoryForgetTool.type).toBe("boolean");
     expect(manifest.configSchema.properties.datasetSwitchTool.type).toBe("boolean");

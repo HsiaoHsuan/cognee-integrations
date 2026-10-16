@@ -9,6 +9,7 @@ import plugin from "../../src/plugin";
 import { CogneeHttpClient } from "../../src/client";
 import { DatasetSwitchStore } from "../../src/dataset-switch";
 import { createPluginApi } from "../../test-utils/fakeApi";
+import { spawnExitWatcher, writeExitWatcherBridge } from "../../src/server";
 
 jest.mock("../../src/client");
 jest.mock("../../src/server", () => {
@@ -106,15 +107,18 @@ describe("memory_switch_dataset end to end", () => {
     expect(qa.sessionId).toBe("open_claw_s1__2");
   });
 
-  it("recalls from the new dataset under the new session id (one graph-scope request)", async () => {
+  it("recalls from the new dataset, and its guidance under the new session id", async () => {
     const h = harness();
     await switchTo(h, "proj-a");
     mockRecall.mockClear();
 
     await h.emit("before_prompt_build", { prompt: "what is the plan for proj-a?" }, CONVO_A);
     const calls = mockRecall.mock.calls.map((c) => c[0]);
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toMatchObject({ scope: ["graph"], datasetIds: ["id-proj-a"], sessionId: "open_claw_s1__2" });
+    expect(calls).toHaveLength(2);
+    const graph = calls.find((c) => c.scope?.includes("graph"))!;
+    expect(graph).toMatchObject({ scope: ["graph"], datasetIds: ["id-proj-a"] });
+    expect(graph.sessionId).toBeUndefined();
+    expect(calls.find((c) => c.scope?.includes("session_context"))).toMatchObject({ datasetIds: ["id-proj-a"], sessionId: "open_claw_s1__2" });
   });
 
   it("leaves another conversation of the same agent on the configured dataset", async () => {
@@ -211,8 +215,28 @@ describe("memory_switch_dataset end to end", () => {
     mockRecall.mockClear();
 
     await h.emit("before_prompt_build", { prompt: "what is the plan?" }, CONVO_A);
-    const calls = mockRecall.mock.calls.map((c) => c[0]);
+    const calls = mockRecall.mock.calls.map((c) => c[0]).filter((c) => c.scope?.includes("graph"));
     expect(calls).toHaveLength(1);
     expect([...calls[0].datasetIds].sort()).toEqual(["ds-company", "id-proj-a"]);
+  });
+});
+
+describe("unclean gateway exit after a switch", () => {
+  it("points the exit watcher's bridge at the switched session and dataset", async () => {
+    const h = harness();
+    await h.emit("before_prompt_build", { prompt: "first prompt here" }, CONVO_A);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(spawnExitWatcher).toHaveBeenCalledWith(expect.objectContaining({ datasetName: "testds", cogneeSessionId: "open_claw_s1" }));
+    expect(writeExitWatcherBridge).not.toHaveBeenCalled();
+
+    await switchTo(h, "proj-a");
+    // The switch tool's after_tool_call updates the watcher before any new prompt.
+    await h.emit("after_tool_call", { toolName: "memory_switch_dataset", params: { action: "switch", dataset: "proj-a" } }, CONVO_A);
+    expect(writeExitWatcherBridge).toHaveBeenCalledWith("s1-will", { datasetName: "proj-a", cogneeSessionId: "open_claw_s1__2" });
+
+    // Unchanged on later prompts: no rewrite.
+    (writeExitWatcherBridge as jest.Mock).mockClear();
+    await h.emit("before_prompt_build", { prompt: "second prompt here" }, CONVO_A);
+    expect(writeExitWatcherBridge).not.toHaveBeenCalled();
   });
 });

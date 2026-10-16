@@ -7,7 +7,7 @@ import { join } from "node:path";
 import type { AgentSyncIndexes, CogneeSearchResult, MemoryScope, ScopedSyncIndexes, SyncIndex, SyncResult } from "./types.js";
 // SyncResult is used as the return type of the per-agent sync helpers below.
 import { MEMORY_SCOPES } from "./types.js";
-import { CogneeHttpClient } from "./client.js";
+import { CogneeHttpClient, requestErrorStatus } from "./client.js";
 import { resolveConfig } from "./config.js";
 import { collectMemoryFiles } from "./files.js";
 import { buildMemoryFlushPlan } from "./flush-plan.js";
@@ -25,6 +25,8 @@ import {
   SYNC_INDEX_PATH,
 } from "./persistence.js";
 import { RecallBreaker, isBreakerError } from "./breaker.js";
+import { type BufferedEntry, isBufferableWriteError, writeBufferFor } from "./write-buffer.js";
+import { buildCapturePolicy, capturePolicyFromEnv, isCogneeSelfReference, redactText, redactValue } from "./capture-policy.js";
 import { compileNoisePatterns, isHarnessNoise } from "./noise.js";
 import { ReferenceCache, createMemoryTools } from "./tools.js";
 import { createMemoryForgetTool } from "./forget-tool.js";
@@ -41,10 +43,14 @@ import {
   renderCodeGraphSection,
 } from "./code-graph.js";
 import { describeImprove } from "./recall-layers.js";
+import { type TrimOptions, trimRecallText } from "./recall-text.js";
+import { capTotal } from "./recall-budget.js";
+import { createMemoryRecapTool } from "./recap-tool.js";
+import { runRecap } from "./recap.js";
 import { DigestTracker, formatFooter, sourceLabel } from "./digest.js";
 import { cogneeSessionId, datasetNameForScope, isMultiScopeEnabled, normalizeAgentId, routeFileToScope } from "./scope.js";
 import { syncFiles, syncFilesScoped } from "./sync.js";
-import { bootServerIfNeeded, waitForServerHealth, isLocalUrl, readBootError, resolveOrMintApiKey, spawnExitWatcher, exitWatcherPidfilePath } from "./server.js";
+import { bootServerIfNeeded, waitForServerHealth, isLocalUrl, readBootError, resolveOrMintApiKey, spawnExitWatcher, exitWatcherPidfilePath, writeExitWatcherBridge } from "./server.js";
 
 /** Expand a leading `~` in a workspace path to the user's home directory. */
 function expandHome(p: string | undefined): string | undefined {
@@ -150,7 +156,15 @@ const memoryCogneePlugin = {
     // Lazy dataset-ID resolver: fires listDatasets() once per unknown name,
     // caches the result so subsequent prompts skip the API call.
     const datasetIdLookups = new Map<string, Promise<string | undefined>>();
+    /** When a lookup last found no dataset by that name; such a miss is retried after the TTL. */
+    const datasetIdMisses = new Map<string, number>();
+    const DATASET_MISS_TTL_MS = 30_000;
     function resolveDatasetIdFromServer(name: string): Promise<string | undefined> {
+      const missedAt = datasetIdMisses.get(name);
+      if (missedAt !== undefined && Date.now() - missedAt >= DATASET_MISS_TTL_MS) {
+        datasetIdMisses.delete(name);
+        datasetIdLookups.delete(name);
+      }
       if (!datasetIdLookups.has(name)) {
         datasetIdLookups.set(name, client.listDatasets()
           .then(async (datasets) => {
@@ -159,6 +173,11 @@ const memoryCogneePlugin = {
               api.logger.info?.(`cognee-openclaw: resolved existing dataset "${name}" → ${match.id}`);
               const state = await loadDatasetState();
               await saveDatasetState({ ...state, [name]: match.id });
+            } else {
+              // Not there yet (a fresh install's first prompt): remember the
+              // miss only briefly, or the dataset the first capture or sync
+              // creates would stay invisible to recall until a restart.
+              datasetIdMisses.set(name, Date.now());
             }
             return match?.id;
           })
@@ -275,6 +294,31 @@ const memoryCogneePlugin = {
     // bookkeeping. Only unavailability signals (network/timeout/5xx) count as
     // failures; 4xx (auth, stale ids) never trip the breaker.
     const firstRecall = new FirstRecall();
+    // Slow streak (claude/codex COGNEE_SLOW_STREAK_THRESHOLD): after this many
+    // prompts in a row whose recall only timed out, the server is treated as
+    // not responding, and each prompt first spends a short /health probe
+    // instead of the full recall budget. Any answered recall resets it. The
+    // breaker (which also counts timeouts) still trips after its threshold.
+    const SLOW_STREAK_THRESHOLD = 3;
+    const READY_PROBE_TIMEOUT_MS = 3_000;
+    let slowStreak = 0;
+
+    async function serverAnswersQuickly(): Promise<boolean> {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), READY_PROBE_TIMEOUT_MS);
+      try {
+        return (await fetch(`${cfg.baseUrl.replace(/\/$/, "")}/health`, { signal: ctrl.signal })).ok;
+      } catch {
+        return false;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    function isTimeoutError(e: unknown): boolean {
+      return e instanceof Error && (e.name === "AbortError" || e.name === "TimeoutError");
+    }
+
     async function recallWithBreaker(
       params: Omit<Parameters<CogneeHttpClient["recall"]>[0], "timeoutMs">,
       timeoutMs = cfg.recallTimeoutMs,
@@ -355,12 +399,22 @@ const memoryCogneePlugin = {
         return out;
       }
 
+      /** Datasets whose lessons a recap lists: every recall dataset, plus the capture dataset. */
+      async function recapDatasetIds(ctx: ConvoCtx & { agentId?: string }): Promise<string[]> {
+        const ids = (await resolveToolDatasets(ctx.agentId, ctx)).map((d) => d.id);
+        const captureName = captureDatasetName(ctx.agentId, ctx);
+        const captureId = (await loadDatasetState())[captureName] ?? await resolveDatasetIdFromServer(captureName);
+        if (captureId && !ids.includes(captureId)) ids.push(captureId);
+        return ids;
+      }
+
       const toolNames = [
         "memory_search",
         "memory_get",
         ...(cfg.memoryForgetTool ? ["memory_forget"] : []),
         ...(cfg.datasetSwitchTool ? ["memory_switch_dataset"] : []),
         ...(cfg.codeSearchTool ? ["memory_code_search"] : []),
+        ...(cfg.recapTool ? ["memory_recap"] : []),
       ];
       const toolLogger = { debug: (m: string) => api.logger.debug?.(m), warn: (m: string) => api.logger.warn?.(m) };
 
@@ -460,6 +514,9 @@ const memoryCogneePlugin = {
               );
             }
             if (codeSearchTool) tools.push(codeSearchTool);
+            if (cfg.recapTool) {
+              tools.push(createMemoryRecapTool({ api: () => client.recapApi(), datasetIds: recapDatasetIds }, memoryCtx));
+            }
             return tools;
           }) as unknown as Parameters<OpenClawPluginApi["registerTool"]>[0],
           { names: toolNames },
@@ -1001,12 +1058,17 @@ const memoryCogneePlugin = {
 
       cognee
         .command("visualise")
-        .description("Visualise the knowledge graph for the current dataset")
-        .action(async () => {
+        .description("Visualise the knowledge graph for the current dataset (multi-scope: the agent dataset, or --dataset)")
+        .option("--dataset <name>", "Dataset to visualise")
+        .option("--agent <id>", "Agent whose dataset to visualise under multi-scope (default: configured agentId)")
+        .action(async (opts: { dataset?: string; agent?: string }) => {
           await stateReady;
-          const dsId = datasetId ?? syncIndex.datasetId;
+          const name = opts.dataset ?? (multiScope ? datasetNameForScope("agent", cfg, opts.agent) : undefined);
+          const dsId = name
+            ? (await loadDatasetState())[name] ?? await resolveDatasetIdFromServer(name)
+            : datasetId ?? syncIndex.datasetId;
           if (!dsId) {
-            console.log("No dataset ID found. Run 'cognee index' first to sync files.");
+            console.log(name ? `Dataset "${name}" not found.` : "No dataset ID found. Run 'cognee index' first to sync files.");
             process.exit(1);
           }
           try {
@@ -1167,9 +1229,10 @@ const memoryCogneePlugin = {
         .command("improve")
         .description("Bridge session-cache QAs (and any feedback) into the permanent graph. With --session-id, scopes to that session; otherwise improves the dataset in general.")
         .option("--session-id <id>", "Session to bridge")
-        .option("--dataset <name>", "Dataset name (default: configured datasetName)")
-        .action(async (opts: { sessionId?: string; dataset?: string }) => {
-          const dsName = opts.dataset ?? (multiScope ? datasetNameForScope("agent", cfg) : cfg.datasetName);
+        .option("--dataset <name>", "Dataset name (default: configured datasetName, or the agent's dataset under multi-scope)")
+        .option("--agent <id>", "Agent whose dataset to improve under multi-scope (default: configured agentId)")
+        .action(async (opts: { sessionId?: string; dataset?: string; agent?: string }) => {
+          const dsName = opts.dataset ?? (multiScope ? datasetNameForScope("agent", cfg, opts.agent) : cfg.datasetName);
           try {
             const result = await client.improve({
               datasetName: dsName,
@@ -1182,6 +1245,53 @@ const memoryCogneePlugin = {
             process.exit(1);
           }
         });
+
+      // Recaps of the sessions Cognee recorded — the same code as the
+      // memory_recap tool (and the claude-code/codex recap skills).
+      const recapCommand = (kind: "standup" | "digest" | "timeline", description: string) => {
+        const cmd = cognee.command(kind);
+        if (kind === "timeline") cmd.argument("<topic...>", "Topic to trace");
+        cmd.description(description)
+          .option("--since <when>", "Window start: 24h, 7d, 2w, today, yesterday, week, month, all, or YYYY-MM-DD")
+          .option("--projects <names>", "Comma-separated agents / repositories to keep")
+          .option("--all-sessions", "Also include sessions other clients recorded into these datasets")
+          .option("--agent <id>", "Agent whose datasets hold the lessons under multi-scope (default: configured agentId)")
+          .option("--json", "Print the structured result instead of Markdown");
+        cmd.action(async (...args: unknown[]) => {
+          const topicWords = kind === "timeline" ? (args[0] as string[]) : [];
+          const opts = (kind === "timeline" ? args[1] : args[0]) as { since?: string; projects?: string; allSessions?: boolean; agent?: string; json?: boolean };
+          await stateReady;
+          const names = multiScope
+            ? cfg.recallScopes.map((scope) => datasetNameForScope(scope, cfg, opts.agent))
+            : [cfg.datasetName];
+          const state = await loadDatasetState();
+          const datasetIds: string[] = [];
+          for (const name of names) {
+            const id = state[name] ?? await resolveDatasetIdFromServer(name);
+            if (id && !datasetIds.includes(id)) datasetIds.push(id);
+          }
+          try {
+            const result = await runRecap(client.recapApi(), {
+              kind,
+              topic: topicWords.join(" "),
+              since: opts.since,
+              projects: opts.projects ? opts.projects.split(",") : undefined,
+              allSessions: opts.allSessions === true,
+              datasetIds,
+              sessionDatasetIds: datasetIds,
+            });
+            for (const w of result.warnings) console.error(`warning: ${w}`);
+            console.log(opts.json ? JSON.stringify(result.json, null, 2) : result.markdown);
+            process.exit(0);
+          } catch (error) {
+            console.log(`Recap failed: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+          }
+        });
+      };
+      recapCommand("standup", "What each agent worked on and left open, from the sessions Cognee recorded (default: last 24h)");
+      recapCommand("digest", "Recorded sessions plus the lessons distilled into memory (default: last 7d)");
+      recapCommand("timeline", "A dated chronology of one topic across recorded sessions (default: last 30d)");
     }, { commands: ["cognee"] });
 
     // ------------------------------------------------------------------
@@ -1208,6 +1318,12 @@ const memoryCogneePlugin = {
       const logger = api.logger;
       const activeDataset = multiScope ? `${cfg.agentDatasetPrefix}/<agent> (per-agent)` : cfg.datasetName;
       logger.info?.(`cognee-openclaw: dataset="${activeDataset}" url="${cfg.baseUrl}" mode=${cfg.mode}`);
+      if (multiScope && cfg.userDatasetPrefix && !cfg.userId) {
+        logger.warn?.(
+          `cognee-openclaw: userDatasetPrefix "${cfg.userDatasetPrefix}" is set but userId is empty, so the user dataset ` +
+            `falls back to "${datasetNameForScope("user", cfg)}", one dataset shared by every user. Set userId (or OPENCLAW_USER_ID).`,
+        );
+      }
 
       let serverHealthy = false;
       try { await client.health(); serverHealthy = true; } catch { /* not up yet */ }
@@ -1243,6 +1359,10 @@ const memoryCogneePlugin = {
       // Inject the resolved/minted key so every subsequent client call
       // authenticates via X-Api-Key instead of the JWT login fallback.
       if (resolvedApiKey) client.setApiKey(resolvedApiKey);
+
+      // Capture writes an earlier outage (or a previous gateway run) left
+      // behind; the server answers now.
+      void drainWriteBuffer(DRAIN_BUDGET_MS);
 
       if (cfg.enableSessions) {
         const anchorName = `cognee-openclaw-gateway-${randomUUID()}`;
@@ -1333,6 +1453,30 @@ const memoryCogneePlugin = {
     // ------------------------------------------------------------------
 
     const captureEnabled = cfg.enableSessions && cfg.captureSession;
+
+    // Which tool calls are captured, and the secret scrubbing applied to every
+    // captured trace and QA (same rules as the claude-code/codex
+    // COGNEE_CAPTURE_* settings, which are the fallback for unset keys). A
+    // pattern that cannot be parsed fails closed: no traces until it is fixed.
+    const captureEnv = capturePolicyFromEnv();
+    const capturePolicy = buildCapturePolicy({
+      tools: cfg.captureTools.length ? cfg.captureTools : captureEnv.tools,
+      denyTools: cfg.captureDenyTools.length ? cfg.captureDenyTools : captureEnv.denyTools,
+      denyPaths: cfg.captureDenyPaths.length ? cfg.captureDenyPaths : captureEnv.denyPaths,
+      redact: cfg.captureRedact,
+      redactPatterns: cfg.captureRedactPatterns.length ? cfg.captureRedactPatterns : captureEnv.redactPatterns,
+      labels: { tools: "captureTools", denyTools: "captureDenyTools", denyPaths: "captureDenyPaths", redactPatterns: "captureRedactPatterns" },
+    });
+    if (captureEnabled && capturePolicy.error) {
+      api.logger.warn?.(`cognee-openclaw: tool calls are NOT being captured: ${capturePolicy.error}`);
+    }
+    if (captureEnabled && capturePolicy.redactError) {
+      api.logger.warn?.(`cognee-openclaw: nothing is being captured until the redaction pattern is fixed: ${capturePolicy.redactError}`);
+    }
+    // Replay budgets (claude/codex COGNEE_DRAIN_BUDGET / _FINAL): short on the
+    // hot path, long at session end where the turns must land before improve.
+    const DRAIN_BUDGET_MS = 20_000;
+    const FINAL_DRAIN_BUDGET_MS = 120_000;
     const MAX_PARAM_CHARS = 4_000;
     const MAX_RETURN_CHARS = 8_000;
     const MAX_QA_CHARS = 8_000;
@@ -1367,6 +1511,37 @@ const memoryCogneePlugin = {
     // awaits this set (per session) before calling improve.
     const pendingStores = new Map<string, Set<Promise<void>>>();
 
+    /** Create-or-return the conversation's capture dataset and cache its id. Never throws. */
+    async function ensureCaptureDataset(rawAgentId: string | undefined, ctx: ConvoCtx): Promise<void> {
+      const name = captureDatasetName(rawAgentId, ctx);
+      try {
+        const id = await client.ensureDataset(name);
+        if (!id) return;
+        const state = await loadDatasetState();
+        if (state[name] !== id) await saveDatasetState({ ...state, [name]: id });
+        if (!multiScope && name === cfg.datasetName && !datasetId) datasetId = id;
+        datasetIdMisses.delete(name);
+        datasetIdLookups.delete(name);
+      } catch (e) {
+        api.logger.warn?.(`cognee-openclaw: could not create dataset "${name}" (captures go on; the server records no dataset for them): ${String(e)}`);
+      }
+    }
+
+    // Last bridge target written per registered conversation, so the sidecar
+    // file is rewritten only when a dataset switch actually moved it.
+    const exitBridgeTargets = new Map<string, string>();
+
+    function refreshExitWatcherBridge(regKey: string, rawAgentId: string | undefined, ctx: ConvoCtx & { sessionId?: string }): void {
+      const agentSessionName = agentSessionNames.get(regKey);
+      if (!agentSessionName || !cfg.persistSessionsAfterEnd || !ctx.sessionId) return;
+      const target = { datasetName: captureDatasetName(rawAgentId, ctx), cogneeSessionId: conversationSessionId(ctx.sessionId, ctx) };
+      const key = `${target.datasetName}\u0000${target.cogneeSessionId}`;
+      const previous = exitBridgeTargets.get(regKey);
+      if (previous === undefined || previous === key) return; // not spawned yet, or unchanged
+      exitBridgeTargets.set(regKey, key);
+      void writeExitWatcherBridge(agentSessionName, target);
+    }
+
     function awaitPendingStores(cogneeSid: string): Promise<void> {
       const set = pendingStores.get(cogneeSid);
       if (!set || set.size === 0) return Promise.resolve();
@@ -1376,16 +1551,51 @@ const memoryCogneePlugin = {
       });
     }
 
+    // Writes the server never received (down, or still booting) wait here and
+    // are replayed once it answers again; see write-buffer.ts.
+    const writeBuffer = writeBufferFor();
+
+    function sendBuffered(item: BufferedEntry): Promise<void> {
+      return client.rememberEntry({ datasetName: item.datasetName, sessionId: item.sessionId, entry: item.entry }).then(() => undefined);
+    }
+
+    function drainWriteBuffer(budgetMs: number, onlySessionId?: string): Promise<number> {
+      // Skip the file read on the hot path while the shared buffer is known to
+      // be empty. Never at session end: it runs once per session, and a wrong
+      // "empty" there lets improve bridge the session without its turns.
+      if (!onlySessionId && !writeBuffer.maybeNonEmpty) return Promise.resolve(0);
+      return writeBuffer.drain(sendBuffered, {
+        budgetMs,
+        sessionId: onlySessionId,
+        onDrop: (item, error) => api.logger.warn?.(`cognee-openclaw: dropped buffered ${item.kind} for ${item.sessionId}: ${String(error)}`),
+      }).then((stored) => {
+        if (stored > 0) api.logger.info?.(`cognee-openclaw: replayed ${stored} buffered capture write(s)`);
+        return stored;
+      }).catch((e: unknown) => {
+        api.logger.warn?.(`cognee-openclaw: buffered write replay failed: ${String(e)}`);
+        return 0;
+      });
+    }
+
     function storeEntry(entry: Record<string, unknown>, rawAgentId: string | undefined, hostSessionId: string, kind: string, ctx?: ConvoCtx): void {
       const convo = ctx ?? { sessionId: hostSessionId };
       const cogneeSid = conversationSessionId(hostSessionId, convo);
+      const datasetName = captureDatasetName(rawAgentId, convo);
       const p: Promise<void> = client.rememberEntry({
-        datasetName: captureDatasetName(rawAgentId, convo),
+        datasetName,
         sessionId: cogneeSid,
         entry,
       }).then(({ entryId }) => {
         api.logger.debug?.(`cognee-openclaw: ${kind} stored${entryId ? ` (${entryId})` : ""}`);
-      }).catch((e: unknown) => {
+        // The server answers again: replay anything an outage left behind.
+        void drainWriteBuffer(DRAIN_BUDGET_MS);
+      }).catch(async (e: unknown) => {
+        if (isBufferableWriteError(e)) {
+          await writeBuffer.enqueue({ datasetName, sessionId: cogneeSid, kind, entry })
+            .then(() => api.logger.info?.(`cognee-openclaw: ${kind} buffered until the Cognee server is reachable (${String(e)})`))
+            .catch((err: unknown) => api.logger.warn?.(`cognee-openclaw: ${kind} store failed and could not be buffered: ${String(err)}`));
+          return;
+        }
         api.logger.warn?.(`cognee-openclaw: ${kind} store failed: ${String(e)}`);
       }).finally(() => {
         const set = pendingStores.get(cogneeSid);
@@ -1399,18 +1609,36 @@ const memoryCogneePlugin = {
       set.add(p);
     }
 
+    if (cfg.enableSessions && cfg.datasetSwitchTool) {
+      api.on("after_tool_call", async (event, ctx) => {
+        if (event.toolName !== "memory_switch_dataset" || !ctx.sessionId) return;
+        refreshExitWatcherBridge(`${normalizeAgentId(ctx.agentId, cfg)}::${ctx.sessionId}`, ctx.agentId, ctx);
+      });
+    }
+
     if (captureEnabled) {
       api.on("after_tool_call", async (event, ctx) => {
         if (!ctx.sessionId) return;
 
+        // Capture policy first: tool allow/deny lists and secret-bearing paths.
+        if (!capturePolicy.allowTool(event.toolName, event.params ?? {})) return;
         // Self-reference guard (mirrors claude/codex): a shell command that
         // mentions cognee is likely the plugin/CLI talking to itself.
-        const cmd = typeof event.params?.command === "string" ? event.params.command : "";
-        if (cmd.includes("cognee")) return;
+        if (isCogneeSelfReference(event.params)) return;
 
-        const params: Record<string, string> = {};
-        for (const [k, v] of Object.entries(event.params ?? {})) {
-          params[k] = truncateForCapture(v, MAX_PARAM_CHARS);
+        // Redact before truncating, so a clipped secret cannot escape matching.
+        let params: Record<string, string>;
+        let returnValue: string;
+        let errorMessage: string;
+        try {
+          params = {};
+          for (const [k, v] of Object.entries(redactValue(event.params ?? {}, capturePolicy))) {
+            params[k] = truncateForCapture(v, MAX_PARAM_CHARS);
+          }
+          returnValue = truncateForCapture(redactValue(event.result ?? "", capturePolicy), MAX_RETURN_CHARS);
+          errorMessage = event.error ? truncateForCapture(redactValue(event.error, capturePolicy), MAX_PARAM_CHARS) : "";
+        } catch {
+          return; // invalid redaction pattern: fail closed (warned at startup)
         }
 
         storeEntry({
@@ -1418,8 +1646,8 @@ const memoryCogneePlugin = {
           origin_function: event.toolName,
           status: event.error ? "error" : "success",
           method_params: params,
-          method_return_value: truncateForCapture(event.result ?? "", MAX_RETURN_CHARS),
-          error_message: event.error ? truncateForCapture(event.error, MAX_PARAM_CHARS) : "",
+          method_return_value: returnValue,
+          error_message: errorMessage,
           // LLM-backed feedback per step is expensive on a busy session;
           // the server-side AUTO_FEEDBACK + improve pass covers synthesis.
           generate_feedback_with_llm: false,
@@ -1433,7 +1661,12 @@ const memoryCogneePlugin = {
         if (!question) return;
         pendingPrompts.delete(hostSessionId);
 
-        const answer = truncateForCapture((event.assistantTexts ?? []).join("\n"), MAX_QA_CHARS);
+        let answer: string;
+        try {
+          answer = truncateForCapture(redactText((event.assistantTexts ?? []).join("\n"), capturePolicy), MAX_QA_CHARS);
+        } catch {
+          return; // invalid redaction pattern: fail closed (warned at startup)
+        }
         if (!answer) return;
 
         storeEntry({
@@ -1456,11 +1689,16 @@ const memoryCogneePlugin = {
           pendingPrompts.delete(ctx.sessionId);
           api.logger.debug?.("cognee-openclaw: skipping QA capture (harness noise: heartbeat/cron/system template)");
         } else {
-          pendingPrompts.set(ctx.sessionId, truncateForCapture(event.prompt, MAX_QA_CHARS));
+          try {
+            pendingPrompts.set(ctx.sessionId, truncateForCapture(redactText(event.prompt, capturePolicy), MAX_QA_CHARS));
+          } catch {
+            pendingPrompts.delete(ctx.sessionId); // invalid redaction pattern: fail closed
+          }
         }
       }
       if (cfg.enableSessions && ctx.sessionId) {
         const regKey = `${normalizeAgentId(ctx.agentId, cfg)}::${ctx.sessionId}`;
+        if (registeredSessions.has(regKey)) refreshExitWatcherBridge(regKey, ctx.agentId, ctx);
         if (!registeredSessions.has(regKey)) {
           registeredSessions.add(regKey);
           const agentSessionName = `${ctx.sessionId}-${normalizeAgentId(ctx.agentId, cfg)}`;
@@ -1479,12 +1717,20 @@ const memoryCogneePlugin = {
             // its own client, and only key-authenticated calls work on servers
             // without the login route (cloud pods).
             if (resolvedApiKey) client.setApiKey(resolvedApiKey);
+            // The capture dataset must exist before this session's first write:
+            // /remember/entry does not create it, and the server records a
+            // session's dataset from the write that opens it, so a session that
+            // starts on a fresh install would stay dataset-less (invisible to
+            // the dataset-scoped recap) and recall could not resolve it either.
+            await ensureCaptureDataset(ctx.agentId, ctx);
             const { connectionId } = await client.registerAgent({
               agentSessionName,
               sessionId: ctx.sessionId,
               datasetNames: resolveAgentDatasetNames(ctx.agentId),
             });
             api.logger.info?.(`cognee-openclaw: agent registered${connectionId ? ` connectionId=${connectionId}` : ""}`);
+            // Baseline for refreshExitWatcherBridge: the target spawned below.
+            exitBridgeTargets.set(regKey, `${captureDatasetName(ctx.agentId, ctx)}\u0000${conversationSessionId(ctx.sessionId, ctx)}`);
             spawnExitWatcher({
               gatewayPid: process.pid,
               agentSessionName,
@@ -1494,8 +1740,8 @@ const memoryCogneePlugin = {
               // On unclean gateway death, bridge this session's cache only when
               // session persistence is enabled. The gateway anchor watcher has
               // no session and stays unregister-only.
-              datasetName: cfg.persistSessionsAfterEnd ? captureDatasetName(ctx.agentId) : undefined,
-              cogneeSessionId: cfg.persistSessionsAfterEnd ? cogneeSessionId(ctx.sessionId) : undefined,
+              datasetName: cfg.persistSessionsAfterEnd ? captureDatasetName(ctx.agentId, ctx) : undefined,
+              cogneeSessionId: cfg.persistSessionsAfterEnd ? conversationSessionId(ctx.sessionId, ctx) : undefined,
               logger: api.logger,
             }).catch(() => {});
           } catch (e: unknown) {
@@ -1526,6 +1772,10 @@ const memoryCogneePlugin = {
         return { appendSystemContext: cfg.memorySteerText };
       });
     }
+
+    // Unset config reads COGNEE_RECALL_PASSAGE_CHARS / COGNEE_RECALL_CONTEXT_CHARS
+    // (the claude-code/codex knobs), then the defaults (2000 / 12000).
+    const recallTrimOptions: TrimOptions = { passageChars: cfg.recallPassageChars, contextChars: cfg.recallContextChars };
 
     if (cfg.autoRecall) {
       api.on("before_prompt_build", async (event, ctx) => {
@@ -1568,6 +1818,12 @@ const memoryCogneePlugin = {
           return;
         }
 
+        if (slowStreak >= SLOW_STREAK_THRESHOLD && !(await serverAnswersQuickly())) {
+          api.logger.info?.(`cognee-openclaw: Cognee server not responding (${slowStreak} slow recalls in a row), skipping recall`);
+          recordTurn(ctx, { count: 0, sources: [] });
+          return;
+        }
+
         const recallKey = ctx.sessionId ? `${normalizeAgentId(ctx.agentId, cfg)}::${ctx.sessionId}` : undefined;
         const first = firstRecall.claim(recallKey);
         const recallTurn = (params: Omit<Parameters<CogneeHttpClient["recall"]>[0], "timeoutMs">) =>
@@ -1606,6 +1862,8 @@ const memoryCogneePlugin = {
         // injection, read after the budget race so a recall that lost the race
         // counts as a miss (its memories never reached the prompt).
         let turnHits: TurnHits = { count: 0, sources: [] };
+        // Set when this turn's graph recall only timed out (feeds slowStreak once).
+        let slowTurn = false;
 
         // Stale-id self-healing for the single request: with one call across
         // every recall dataset the server does not say which id went stale, so
@@ -1626,57 +1884,126 @@ const memoryCogneePlugin = {
           return fresh.length > 0 && !unchanged ? fresh : undefined;
         };
 
+        // Resolve a side lane by the recall deadline (less a margin for
+        // assembling the injection), falling back when it is not done.
+        const LANE_MARGIN_MS = 250;
+        const byDeadline = <T,>(lane: Promise<T>, fallback: T): Promise<T> => {
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          const late = new Promise<T>((r) => {
+            timer = setTimeout(() => r(fallback), Math.max(0, deadline - performance.now() - LANE_MARGIN_MS));
+          });
+          return Promise.race([lane, late]).finally(() => clearTimeout(timer));
+        };
+
         const doRecall = async (): Promise<Record<string, string> | undefined> => {
         try {
-          // ONE explicit graph-scope, only_context request across every recall
-          // dataset (all scopes under multi-scope). On cognee >= 1.6.0 the
-          // completion search types answer it with one item per dataset whose
-          // `text` is the full LLM input the completion would have received:
-          // this conversation's history (hence session_id is required), the
-          // question plus retrieved context rendered through the retriever's
-          // user template, then the session guidance block. That text is the
-          // memory and is injected verbatim — never parsed, stripped or
-          // truncated — and it already carries what the plugin used to fetch
-          // with separate session/trace/session_context requests, so those are
-          // gone. Older servers (1.5.x) return the bare retrieval context in
-          // `text` and render through the same path. The item's separate
-          // `system_prompt` (the retriever's task template) is never read.
+          // Two requests for memory, as in the claude-code/codex hooks (SDK-904).
+          //
+          // Graph: ONE explicit graph-scope, only_context request across every
+          // recall dataset (all scopes under multi-scope), sent WITHOUT the
+          // session id. On cognee >= 1.6.0 the completion search types answer
+          // it with one item per dataset whose `text` is the LLM input the
+          // completion would have received; with a session id that input also
+          // carries this conversation's last turns — the agent's own context,
+          // which was most of a mid-session payload. trimRecallText then keeps
+          // only the retrieved context: the question template goes, passages
+          // from this very session go, the rest is capped. Text it cannot parse
+          // (an older server's bare context) is injected whole.
+          //
+          // Guidance: the small session_context block (lessons the server
+          // distilled from this session's traces) comes from its own request,
+          // with the session id, against the capture dataset. A 404 means no
+          // guidance exists yet.
           const recallGraph = (ids: string[]) => recallTurn({
             queryText: event.prompt,
             searchType: cfg.searchType,
             datasetIds: ids,
             searchPrompt: cfg.searchPrompt,
             topK: cfg.maxResults,
-            sessionId: recallSessionId,
             scope: ["graph"],
             onlyContext: true,
           });
 
-          let results: CogneeSearchResult[];
+          const guidanceLane: Promise<string> = (async () => {
+            if (!recallSessionId) return "";
+            const name = captureDatasetName(ctx.agentId, ctx);
+            const dsId = (await loadDatasetState())[name];
+            if (!dsId) return "";
+            const items = await recallTurn({
+              queryText: event.prompt,
+              searchPrompt: "",
+              datasetIds: [dsId],
+              topK: cfg.maxResults,
+              sessionId: recallSessionId,
+              scope: ["session_context"],
+              contextProfile: "qa",
+              onlyContext: true,
+            });
+            return items.map((r) => r.text.trim()).filter(Boolean).join("\n\n");
+          })().catch((e: unknown) => {
+            if (requestErrorStatus(e) !== 404) api.logger.debug?.(`cognee-openclaw: guidance recall failed: ${String(e)}`);
+            return "";
+          });
+
+          // A failed graph request must not take the guidance and code lanes
+          // down with it: each lane injects what it has.
+          let results: CogneeSearchResult[] = [];
           try {
-            results = await recallGraph(recallDatasetIds);
+            try {
+              results = await recallGraph(recallDatasetIds);
+            } catch (e) {
+              if (isTimeoutError(e)) slowTurn = true;
+              if (!isStaleDatasetError(e)) throw e;
+              const fresh = await healRecallDatasetIds();
+              if (!fresh) throw e;
+              results = await recallGraph(fresh);
+            }
+            slowStreak = 0;
           } catch (e) {
-            if (!isStaleDatasetError(e)) throw e;
-            const fresh = await healRecallDatasetIds();
-            if (!fresh) throw e;
-            results = await recallGraph(fresh);
+            api.logger.warn?.(`cognee-openclaw: recall failed: ${String(e)}`);
           }
 
           api.logger.info?.(`cognee-openclaw: recall returned ${results.length} result(s)${results.length > 0 ? `, scores=[${results.map(r => r.score.toFixed(2)).join(",")}]` : ""}`);
 
           // One item per dataset — never sliced to maxResults (that would drop
           // a whole dataset); top_k already bounds retrieval server-side.
-          const filtered = results.filter((r) => r.score >= cfg.minScore && typeof r.text === "string" && r.text.trim().length > 0);
+          let itemGuidance = "";
+          let filtered = results
+            .filter((r) => r.score >= cfg.minScore && typeof r.text === "string" && r.text.trim().length > 0)
+            .map((r) => {
+              const { context, guidance, stats } = trimRecallText(r.text, event.prompt, recallSessionId ?? "", recallTrimOptions);
+              if (guidance && !itemGuidance) itemGuidance = guidance;
+              api.logger.debug?.(`cognee-openclaw: ${stats.parsed ? "recall_context_trimmed" : "recall_context_unparsed"} ${JSON.stringify(stats)}`);
+              return { ...r, text: context };
+            })
+            .filter((r) => r.text.trim().length > 0);
 
-          const codeSections = await codeLane;
-          if (filtered.length === 0 && codeSections.length === 0) {
+          // The side lanes ran alongside the graph request; take what they
+          // have by the deadline, so a slow one is dropped instead of making
+          // the whole turn miss its budget. A preferences block can trail the
+          // graph item even without a session id; the guidance request renders
+          // the same lines, so it wins.
+          const guidance = (await byDeadline(guidanceLane, "")) || itemGuidance.trim();
+          const codeSections = await byDeadline(codeLane, [] as string[]);
+          if (filtered.length === 0 && codeSections.length === 0 && !guidance) {
             api.logger.info?.(`cognee-openclaw: no results above minScore=${cfg.minScore}`);
             return;
           }
 
+          // One cap on everything injected (recallContextChars): this
+          // session's guidance first, then each dataset's memory in recall
+          // order, then code facts.
+          const capped = capTotal([guidance, ...filtered.map((r) => r.text), ...codeSections], cfg.recallContextChars, (i) => i > filtered.length);
+          const keptGuidance = capped[0] ?? "";
+          const memories = filtered
+            .map((r, i) => ({ ...r, text: capped[1 + i] ?? "" }))
+            .filter((r) => r.text.trim().length > 0);
+          const keptCode = capped.slice(1 + filtered.length).filter((c) => c.trim().length > 0);
+          filtered = memories;
           const sections = [
             ...filtered.map((r) => `<cognee_memory>\n${r.text}\n</cognee_memory>`),
-            ...codeSections,
+            ...keptCode,
+            ...(keptGuidance ? [`<cognee_guidance>\n${keptGuidance}\n</cognee_guidance>`] : []),
           ];
 
           api.logger.info?.(`cognee-openclaw: injecting ${filtered.length} memory block(s) from ${recallDatasetIds.length} dataset(s) via ${cfg.recallInjectionPosition}, preview: ${filtered.map(r => r.text.slice(0, 80).replace(/\n/g, " ")).join(" | ")}`);
@@ -1698,6 +2025,8 @@ const memoryCogneePlugin = {
           budgetTimer = setTimeout(() => { budgetHit = true; r(undefined); }, Math.max(0, deadline - performance.now()));
         });
         const injection = await Promise.race([doRecall(), budget]).finally(() => clearTimeout(budgetTimer));
+        if (budgetHit && injection === undefined) slowTurn = true;
+        if (slowTurn) slowStreak += 1;
         if (budgetHit && injection === undefined) {
           api.logger.warn?.(`cognee-openclaw: recall budget (${cfg.recallBudgetMs}ms) exceeded — continuing without memories`);
         }
@@ -1869,6 +2198,12 @@ const memoryCogneePlugin = {
           await fn();
           return;
         } catch (error) {
+          // 402: the server's LLM budget is exhausted (cognee >= 1.6.3 improve).
+          // Retrying 10s later cannot succeed, so stop and say why.
+          if (requestErrorStatus(error) === 402) {
+            api.logger.warn?.(`cognee-openclaw: ${label} skipped: the Cognee server's LLM budget is exhausted (402); not retrying`);
+            return;
+          }
           api.logger.warn?.(`cognee-openclaw: ${label} failed (attempt ${attempt}/${FINAL_SYNC_RETRIES}): ${String(error)}`);
           if (attempt < FINAL_SYNC_RETRIES) {
             await new Promise((r) => setTimeout(r, FINAL_SYNC_RETRY_DELAY_MS));
@@ -1921,7 +2256,7 @@ const memoryCogneePlugin = {
         // below fall back to JWT login, which servers without a login route
         // (cloud tenants) answer with 404.
         if (!resolvedApiKey) {
-          resolvedApiKey = await resolveOrMintApiKey(client, api.logger).catch(() => "");
+          resolvedApiKey = await resolveOrMintApiKey(client, api.logger, cfg.apiKey).catch(() => "");
         }
         if (resolvedApiKey) client.setApiKey(resolvedApiKey);
 
@@ -1947,6 +2282,9 @@ const memoryCogneePlugin = {
           // Let this session's in-flight capture writes land first; improve
           // only bridges what is already in the session cache.
           await awaitPendingStores(endSessionId);
+          // ...and replay this session's writes an outage left in the buffer,
+          // or improve would bridge a session missing those turns.
+          await drainWriteBuffer(FINAL_DRAIN_BUDGET_MS, endSessionId);
           const dsName = captureDatasetName(endAgentId, endCtx);
           // The dataset must exist before improve bridges into it: servers up
           // to 1.4.0 skip session persistence (non-fatally, so improve still

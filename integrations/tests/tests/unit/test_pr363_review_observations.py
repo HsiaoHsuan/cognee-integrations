@@ -89,6 +89,44 @@ def test_malformed_read_dataset_ids_env_names_the_setting(suite, isolated_module
     )
 
 
+# What a server's API description says when POST /api/v1/remember/entry takes a
+# dataset id: the field in the operation's request body, inline here and, as
+# real servers write it, behind a $ref below.
+_ENTRY_TAKES_DATASET_ID = {
+    "paths": {
+        "/api/v1/remember/entry": {
+            "post": {
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {"properties": {"dataset_id": {}, "dataset_name": {}}}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+_ENTRY_TAKES_DATASET_ID_BY_REF = {
+    "paths": {
+        "/api/v1/remember/entry": {
+            "post": {
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/RememberEntryPayload"}
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "components": {
+        "schemas": {"RememberEntryPayload": {"properties": {"dataset_id": {}, "entry": {}}}}
+    },
+}
+
+
 def test_shared_uuid_is_used_by_write_and_registration(suite, isolated_modules, monkeypatch):
     from uuid import uuid4
 
@@ -99,9 +137,7 @@ def test_shared_uuid_is_used_by_write_and_registration(suite, isolated_modules, 
         pc,
         "_json_http_request",
         lambda path, payload=None, **kw: (
-            {"paths": {"/api/v1/remember/entry": {"post": {"x-cognee-session-dataset-ids": True}}}}
-            if path == "/openapi.json"
-            else calls.append(payload) or {}
+            _ENTRY_TAKES_DATASET_ID if path == "/openapi.json" else calls.append(payload) or {}
         ),
     )
     pc.remember_entry_via_http(ident, "session", {"type": "qa", "question": "q", "answer": "a"})
@@ -195,7 +231,7 @@ def test_old_sdk_cannot_accept_uuid_session_writes(suite, isolated_modules, monk
 
     def request(path, *args, **kwargs):
         calls.append(path)
-        # The old SDK has a dataset_id schema field but rejects it in remember().
+        # An old server: its entry endpoint lists no dataset_id in its request body.
         return {"paths": {"/api/v1/remember/entry": {"post": {}}}}
 
     monkeypatch.setattr(pc, "_json_http_request", request)
@@ -204,6 +240,28 @@ def test_old_sdk_cannot_accept_uuid_session_writes(suite, isolated_modules, monk
             str(uuid4()), "session", {"type": "qa", "question": "q", "answer": "a"}
         )
     assert calls == ["/openapi.json"]
+
+
+def test_typed_dataset_support_is_read_from_the_entry_schema(suite, isolated_modules, monkeypatch):
+    """The capability is what the server's own API description says: the
+    request body of POST /api/v1/remember/entry lists ``dataset_id``, inline
+    or behind a ``$ref`` as real servers write it. A custom marker no server
+    emits used to be required, which refused every real server."""
+    pc = isolated_modules(suite, "_plugin_common")
+    for spec in (_ENTRY_TAKES_DATASET_ID, _ENTRY_TAKES_DATASET_ID_BY_REF):
+        pc._TYPED_DATASET_CAPABILITIES.clear()
+        monkeypatch.setattr(pc, "_json_http_request", lambda *a, **k: spec)
+        pc.require_typed_dataset_id_support(service_url="https://tenant-x.stg-aws.cognee.ai")
+    pc._TYPED_DATASET_CAPABILITIES.clear()
+    monkeypatch.setattr(
+        pc,
+        "_json_http_request",
+        lambda *a, **k: {
+            "paths": {"/api/v1/remember/entry": {"post": {"x-cognee-session-dataset-ids": True}}}
+        },
+    )
+    with pytest.raises(RuntimeError, match="takes no dataset_id"):
+        pc.require_typed_dataset_id_support(service_url="https://tenant-x.stg-aws.cognee.ai")
 
 
 def test_unsupported_shared_switch_aborts_before_sync(suite, hook_module, monkeypatch):
@@ -243,6 +301,47 @@ def test_owned_uuid_selection_uses_compatible_owned_name(suite, hook_module, mon
             "datasets": [{"id": ident, "name": "owned", "owner_id": "writer", "writable": True}],
             "readonly": [],
         },
+    )
+    monkeypatch.setattr(switch, "_sync_current", lambda *args: None)
+    chosen = []
+
+    def inspect(target):
+        chosen.append(target)
+        raise RuntimeError("inspection complete")
+
+    monkeypatch.setattr(switch, "_ensure_dataset", inspect)
+    with pytest.raises(RuntimeError, match="inspection complete"):
+        switch._switch("host", {"session_id": "old", "dataset": "previous"}, ident, force=False)
+    assert chosen == ["owned"]
+
+
+def test_switch_takes_the_principal_from_the_lister_when_the_record_has_none(
+    suite, hook_module, monkeypatch
+):
+    """A cloud tenant the session was not registered on leaves no user id in
+    the launch record. The lister resolves it from the data plane; the switch
+    must use it, or the user's own dataset counts as someone else's and is
+    switched to by UUID through the typed-dataset gate."""
+    from uuid import uuid4
+
+    switch = hook_module(suite, "switch-dataset.py")
+    import _plugin_common as pc
+
+    ident = str(uuid4())
+    monkeypatch.setattr(switch, "load_resolved", lambda **kw: {})
+    monkeypatch.setattr(
+        switch,
+        "list_writable_datasets",
+        lambda *args: {
+            "user_id": "writer",
+            "datasets": [{"id": ident, "name": "owned", "owner_id": "writer", "writable": True}],
+            "readonly": [],
+        },
+    )
+    monkeypatch.setattr(
+        pc,
+        "require_typed_dataset_id_support",
+        lambda **kw: (_ for _ in ()).throw(AssertionError("gate ran")),
     )
     monkeypatch.setattr(switch, "_sync_current", lambda *args: None)
     chosen = []

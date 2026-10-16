@@ -1,6 +1,6 @@
 name: cognee
 kind: exclusive
-version: 1.3.1
+version: 1.3.2
 description: "Cognee memory provider for Hermes Agent: session-aware graph memory, recall, forget, and session-end improvement."
 pip_dependencies:
   # Exact pin: the installed package doubles as the local server this plugin
@@ -12,4 +12,5 @@ pip_dependencies:
   - cognee==1.6.1
 hooks:
   - on_session_end
+  - on_pre_compress
   - on_memory_write

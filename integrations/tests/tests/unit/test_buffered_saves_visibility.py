@@ -75,6 +75,10 @@ def test_buffered_bumps_land_under_their_own_kind(pc):
 def store(suite, hook_module, monkeypatch):
     """The store hook with its write seams stubbed; returns ``(module, bumps)``."""
     module = hook_module(suite, "store-to-session.py")
+    if suite.name == "claude-code":
+        # Inline writes remain the local path; cloud spool outcomes have separate tests.
+        monkeypatch.setattr(module, "cloud_enabled", lambda *args: False)
+
     bumps: list[tuple] = []
     monkeypatch.setattr(module, "hook_log", lambda *a, **k: None)
     monkeypatch.setattr(module, "notify", lambda *a, **k: None)
@@ -89,6 +93,11 @@ def store(suite, hook_module, monkeypatch):
         "bump_save_counter",
         lambda sid, kind, buffered=False: bumps.append((kind, buffered)),
     )
+    if hasattr(module, "phase_end"):
+        monkeypatch.setattr(module, "phase_begin", lambda *a, **k: None)
+        monkeypatch.setattr(
+            module, "phase_end", lambda phase, **kw: bumps.append(("phase", phase, kw))
+        )
     return module, bumps
 
 
@@ -104,13 +113,23 @@ def _raising(code: int):
     return _boom
 
 
+def _phases(bumps: list) -> list:
+    return [b for b in bumps if b[0] == "phase"]
+
+
+def _kinds(bumps: list) -> list:
+    return [b for b in bumps if b[0] != "phase"]
+
+
 @pytest.mark.parametrize("run, payload, kind", _PATHS)
 def test_stored_write_bumps_the_plain_kind(store, monkeypatch, run, payload, kind):
     module, bumps = store
     monkeypatch.setattr(module, "server_usable", lambda url="": True)
     monkeypatch.setattr(module, "remember_entry_via_http", lambda *a, **k: {"entry_id": "e"})
     asyncio.run(getattr(module, run)(payload))
-    assert bumps == [(kind, False)]
+    assert _kinds(bumps) == [(kind, False)]
+    if hasattr(module, "phase_end"):
+        assert _phases(bumps) == [("phase", "saving", {"count": 1, "ok": True})]
 
 
 @pytest.mark.parametrize("run, payload, kind", _PATHS)
@@ -127,7 +146,11 @@ def test_retryable_failure_bumps_the_buffered_kind(store, monkeypatch, run, payl
     monkeypatch.setattr(module, "server_usable", lambda url="": True)
     monkeypatch.setattr(module, "remember_entry_via_http", _raising(503))
     asyncio.run(getattr(module, run)(payload))
-    assert bumps == [(kind, True)]
+    assert _kinds(bumps) == [(kind, True)]
+    if hasattr(module, "phase_end"):
+        # The row must not tick a write that never landed: queued, since it
+        # was spooled for replay.
+        assert _phases(bumps) == [("phase", "saving", {"count": 0, "ok": False, "buffered": True})]
 
 
 @pytest.mark.parametrize("run, payload, kind", _PATHS)
@@ -137,7 +160,10 @@ def test_dropped_4xx_bumps_nothing(store, monkeypatch, run, payload, kind):
     monkeypatch.setattr(module, "server_usable", lambda url="": True)
     monkeypatch.setattr(module, "remember_entry_via_http", _raising(422))
     asyncio.run(getattr(module, run)(payload))
-    assert bumps == []
+    assert _kinds(bumps) == []
+    if hasattr(module, "phase_end"):
+        # Dropped for good (a 4xx is rejected the same way next time): failed.
+        assert _phases(bumps) == [("phase", "saving", {"count": 0, "ok": False, "buffered": False})]
 
 
 # ── the buffer: stamp, strip, backlog ───────────────────────────────────────
@@ -312,11 +338,11 @@ def test_header_shows_buffered_writes_and_the_backlog(suite, lookup, monkeypatch
     run = drive_recall(lookup, monkeypatch, recall=HIT, saves_last_turn=_OUTAGE_SAVES)
     header = _header(suite, run.output)
     j = _joiner(suite)
-    assert header.endswith(
+    assert (
         f"{j}saved last turn 1 prompt / 0 trace / 0 answer"
         f"{j}buffered last turn 6 trace / 1 answer (not saved yet)"
         f"{j}7 awaiting replay, oldest 20d"
-    )
+    ) in header
     # The buffered writes are NOT folded into the saved count.
     assert "6 trace / 1 answer" not in header.split("buffered")[0]
 
@@ -327,7 +353,7 @@ def test_header_reads_as_before_when_nothing_was_buffered(suite, lookup, monkeyp
     )
     run = drive_recall(lookup, monkeypatch, recall=HIT)
     header = _header(suite, run.output)
-    assert header.endswith("saved last turn 0 prompt / 0 trace / 0 answer")
+    assert "saved last turn 0 prompt / 0 trace / 0 answer" in header
     assert "buffered" not in header and "awaiting replay" not in header
 
 

@@ -1,6 +1,15 @@
 ---
 name: cognee-forget
-description: Forget data stored in Cognee memory. Use when the user asks to forget, delete, or remove something from memory (e.g. "forget what we talked about tennis", "delete that from memory"). Finds the documents in the current dataset whose raw content matches what the user wants forgotten and deletes them.
+description: >-
+  Forget something stored in Cognee memory: find the documents in the current dataset
+  whose content matches by meaning, confirm, then delete them and their graph knowledge.
+  Deletes a whole dataset only on explicit request.
+when_to_use: >-
+  E.g. "forget what we talked about X", "delete that from memory", "remove what you know
+  about X", "stop remembering X", "I pasted a secret, wipe it", "delete the <dataset>
+  dataset". Not for a conversational "forget it" or "never mind", leaving a dataset
+  without deleting (cognee-switch-datasets), stopping capture (cognee-how-it-works), or
+  editing CLAUDE.md or MEMORY.md.
 ---
 
 # Cognee Forget

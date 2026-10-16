@@ -158,13 +158,20 @@ def test_agent_recall_by_uuid_reaches_the_canonical_dataset(suite, pc, bootstrap
     assert "datasets" not in (entry.get("json") or {})
 
 
-def test_agent_remember_entry_targets_the_canonical_dataset_id(pc, bootstrap, mock_server):
+def test_agent_remember_entry_targets_the_canonical_dataset_id(
+    pc, bootstrap, mock_server, monkeypatch
+):
     module, run = bootstrap
     _uid, _key, _n, ok = run({})
     assert ok
     write_id, _ = pc.resolve_active_dataset_ids("host-shared-1")
+    probes = []
+    monkeypatch.setattr(pc, "require_typed_dataset_id_support", lambda **kw: probes.append(kw))
     pc.remember_entry_via_http("agent_sessions", "s1", {"role": "user", "content": "hi"})
     mock_server.assert_called("POST", "/api/v1/remember/entry", dataset_id=write_id)
+    # Hooks are short-lived processes: a named write must not probe /openapi.json
+    # on every capture. Only a UUID-shaped write target needs the probe.
+    assert probes == []
 
 
 def test_existing_same_named_copies_stay_readable(suite, pc, bootstrap, mock_server, monkeypatch):

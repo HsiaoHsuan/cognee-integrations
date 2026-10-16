@@ -19,7 +19,7 @@ def _run(hook, monkeypatch, prompt, **env):
     monkeypatch.setattr(hook, "get_session_key", lambda: "key")
     recalled = []
 
-    async def fake_run(prompt, cwd):
+    async def fake_run(prompt, cwd, **kwargs):
         recalled.append(prompt)
         return None
 
