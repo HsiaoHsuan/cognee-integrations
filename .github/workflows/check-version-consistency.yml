@@ -11,16 +11,6 @@ on:
       - 'scripts/check_version_consistency.py'
       - 'scripts/tests/test_version_consistency.py'
       - '.github/workflows/check-version-consistency.yml'
-  push:
-    branches: [main]
-    paths:
-      - 'integrations/inventory.yml'
-      - 'integrations/**/plugin.json'
-      - 'integrations/*/package.json'
-      - '.claude-plugin/marketplace.json'
-      - 'scripts/check_version_consistency.py'
-      - 'scripts/tests/test_version_consistency.py'
-      - '.github/workflows/check-version-consistency.yml'
 
 permissions:
   contents: read
