@@ -245,6 +245,16 @@ class TestSyncTurn(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 
+def _graph_prefetch_call(provider, fake):
+    """The kwargs of one prefetch's graph request, once every lane has run."""
+    provider.queue_prefetch("q")
+    provider._prefetch_thread.join(timeout=5.0)
+    calls = [kwargs for kwargs in fake.kwargs_for("recall") if kwargs["scope"] == ["graph"]]
+    if len(calls) != 1:
+        raise AssertionError(f"expected exactly 1 graph recall, got {len(calls)}")
+    return calls[0]
+
+
 class TestPrefetchProtocol(unittest.TestCase):
     """The two-phase protocol around the per-prompt memory block; the block's
     own request and rendering are characterized in test_layered_recall."""
@@ -295,11 +305,10 @@ class TestPrefetchProtocol(unittest.TestCase):
     def test_prefetch_uses_a_smaller_budget_than_explicit_recall(self):
         with fake_backend() as fake:
             provider = make_provider(top_k=12)
-            provider.queue_prefetch("q")
-            self.assertTrue(fake.wait("recall"))
-            kwargs = fake.only_call("recall")
+            kwargs = _graph_prefetch_call(provider, fake)
         self.assertEqual(kwargs["top_k"], 5)
-        self.assertIsNotNone(kwargs["session_id"])
+        # The graph request carries no session id (SDK-904); the guidance lane does.
+        self.assertIsNone(kwargs["session_id"])
         self.assertIsNotNone(kwargs["datasets"])
         self.assertEqual(kwargs["scope"], ["graph"])
         self.assertEqual(kwargs["query_type"], "HYBRID_COMPLETION")
@@ -310,18 +319,14 @@ class TestPrefetchProtocol(unittest.TestCase):
         # is gone: the toggle is not read, and the request is the graph one.
         with fake_backend() as fake:
             provider = make_provider(config={"recall_session_layers": False})
-            provider.queue_prefetch("q")
-            self.assertTrue(fake.wait("recall"))
-            kwargs = fake.only_call("recall")
+            kwargs = _graph_prefetch_call(provider, fake)
         self.assertEqual(kwargs["scope"], ["graph"])
         self.assertIs(kwargs["only_context"], True)
 
     def test_prefetch_budget_respects_a_lower_configured_top_k(self):
         with fake_backend() as fake:
             provider = make_provider(top_k=2)
-            provider.queue_prefetch("q")
-            self.assertTrue(fake.wait("recall"))
-            self.assertEqual(fake.only_call("recall")["top_k"], 2)
+            self.assertEqual(_graph_prefetch_call(provider, fake)["top_k"], 2)
 
     def test_every_memory_item_is_injected_whole(self):
         # No line cap and no 500-character cut: the item's text is the memory.

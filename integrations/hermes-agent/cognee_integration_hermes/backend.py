@@ -84,6 +84,13 @@ class MemoryBackend:
         against a fresh instance would otherwise hit a missing dataset.
         """
 
+    def probe_health(self, *, timeout: float) -> bool:
+        """Whether the server answers ``/health`` within ``timeout``.
+
+        In-process transports have no server to probe and always answer.
+        """
+        return True
+
     # -- operations --------------------------------------------------------
 
     def recall(
@@ -119,10 +126,23 @@ class MemoryBackend:
         raise NotImplementedError
 
     def remember_permanent(
-        self, *, text: str, dataset: str, session_ids: list[str], timeout: float
+        self,
+        *,
+        text: str,
+        dataset: str,
+        session_ids: list[str],
+        timeout: float,
+        chunk_size: int = 0,
     ) -> Any:
-        """Store content in the permanent graph."""
+        """Store content in the permanent graph. ``chunk_size`` > 0 caps the
+        tokens per chunk; 0 leaves it to the server."""
         raise NotImplementedError
+
+    def remember_entry(
+        self, *, entry: dict[str, Any], session_id: str, dataset: str, timeout: float
+    ) -> Any:
+        """Store one typed session entry (a ``trace`` of a tool call, or a ``qa``)."""
+        raise self._http_only("typed session entries (tool-call traces)")
 
     def forget(
         self,
@@ -157,8 +177,21 @@ class MemoryBackend:
     def list_datasets(self, *, timeout: float) -> list[dict[str, Any]]:
         raise self._http_only("listing datasets")
 
-    def list_dataset_data(self, *, dataset_id: str, timeout: float) -> list[dict[str, Any]]:
+    def list_dataset_data(
+        self,
+        *,
+        dataset_id: str,
+        timeout: float,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
         raise self._http_only("listing dataset documents")
+
+    def list_sessions(self, *, range: str, limit: int, offset: int, timeout: float) -> Any:
+        raise self._http_only("listing sessions")
+
+    def get_session(self, *, session_id: str, timeout: float) -> Optional[dict[str, Any]]:
+        raise self._http_only("reading a session")
 
     def read_raw_data(self, *, dataset_id: str, data_id: str, timeout: float) -> str:
         raise self._http_only("reading a stored document")
@@ -357,9 +390,10 @@ class SdkBackend(MemoryBackend):
             self._do_remember_session(text, session_id, dataset), timeout=timeout
         )
 
-    def remember_permanent(self, *, text, dataset, session_ids, timeout) -> Any:
+    def remember_permanent(self, *, text, dataset, session_ids, timeout, chunk_size=0) -> Any:
         return self._bridge.run(
-            self._do_remember_permanent(text, dataset, session_ids), timeout=timeout
+            self._do_remember_permanent(text, dataset, session_ids, chunk_size=chunk_size),
+            timeout=timeout,
         )
 
     def forget(self, *, dataset, everything, memory_only, timeout) -> dict[str, Any]:
@@ -485,7 +519,9 @@ class SdkBackend(MemoryBackend):
         self._add_user_kwarg(kwargs)
         return await cognee.remember(**kwargs)
 
-    async def _do_remember_permanent(self, content: str, dataset: str, session_ids: list[str]):
+    async def _do_remember_permanent(
+        self, content: str, dataset: str, session_ids: list[str], chunk_size: int = 0
+    ):
         import cognee
 
         kwargs: dict[str, Any] = {
@@ -494,6 +530,8 @@ class SdkBackend(MemoryBackend):
             "self_improvement": True,
             "session_ids": session_ids,
         }
+        if chunk_size > 0:
+            kwargs["chunk_size"] = chunk_size
         self._add_user_kwarg(kwargs)
         return await cognee.remember(**kwargs)
 

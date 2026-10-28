@@ -29,9 +29,25 @@ from .config import (
     SHARED_COGNEE_HOME,
     SHARED_PLUGIN_STATE_DIR,
     ollama_embedding_pins,
+    secret,
 )
 
 logger = logging.getLogger(__name__)
+
+# LLM providers cognee can reach without an API key (a local model server).
+_KEYLESS_LLM_PROVIDERS = frozenset({"ollama"})
+_warned_no_llm_key = False
+# Every API key cognee's LLM and embedding clients read. The server gets each one
+# from the profile's secret scope only, so a profile never bills its calls to a
+# key the gateway's environment holds for another profile. Non-secret settings
+# (provider, model, endpoint) are inherited as before: calls bill to the key.
+_PROFILE_SECRETS = (
+    "LLM_API_KEY",
+    "EMBEDDING_API_KEY",
+    "LLM_EXTRACTION_API_KEY",
+    "LLM_QUERY_API_KEY",
+    "LLM_SUMMARIZATION_API_KEY",
+)
 
 
 def health_ok(url, timeout=2.0):
@@ -98,8 +114,54 @@ def rotate_oversized_log(log_path, max_bytes=None):
         return False
 
 
+def server_workdir():
+    """Where the spawned server runs: the plugin's own state directory.
+
+    cognee >= 1.6.2 loads the first ``.env`` found walking up from its working
+    directory and lets it override the environment, so a server started in the
+    directory Hermes was launched from could pick up an unrelated project's
+    ``.env``. Its settings come from Hermes instead (``_spawn``).
+    """
+    workdir = SHARED_PLUGIN_STATE_DIR / "hermes"
+    try:
+        workdir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    return str(workdir)
+
+
+def _warn_no_llm_key(env):
+    """Say once, at boot, that the server will have no LLM key.
+
+    Without it cognify and improve fail later, and only server.log says so. A
+    keyless provider (Ollama) needs none, so it gets no warning.
+    """
+    global _warned_no_llm_key
+    provider = str(env.get("LLM_PROVIDER") or "").strip().lower()
+    if _warned_no_llm_key or provider in _KEYLESS_LLM_PROVIDERS:
+        return
+    _warned_no_llm_key = True
+    logger.warning(
+        "Starting the local cognee server without an LLM key: memory will not be "
+        "built. Run `hermes memory setup` (or set LLM_API_KEY in Hermes' .env); "
+        "keys kept only for the other cognee plugins are not read by this one."
+    )
+
+
 def _spawn(port, data_root, system_root, log_path):
     env = dict(os.environ)
+    # The server's API keys come from Hermes (the profile's secret scope), never
+    # from a file the plugin reads itself: the plugin-catalog rules forbid that,
+    # and under a multi-profile gateway os.environ may hold another profile's.
+    # Each is dropped first, so a profile without one never boots the server on
+    # the inherited value.
+    for name in _PROFILE_SECRETS:
+        env.pop(name, None)
+        value = secret(name)
+        if value:
+            env[name] = value
+    if "LLM_API_KEY" not in env:
+        _warn_no_llm_key(env)
     env["COGNEE_AGENT_MODE"] = "true"  # server tears itself down once idle / no clients
     env["HTTP_API_PORT"] = str(port)
     # The server must behave identically no matter which cognee plugin booted it,
@@ -160,6 +222,7 @@ def _spawn(port, data_root, system_root, log_path):
                 str(port),
             ],
             env=env,
+            cwd=server_workdir(),
             stdout=log,
             stderr=log,
             start_new_session=True,  # detach: outlive the spawning call

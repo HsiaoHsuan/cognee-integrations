@@ -12,7 +12,15 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
-from . import code_graph, dataset_overrides, exit_watcher
+from . import (
+    capture_policy,
+    code_graph,
+    dataset_overrides,
+    exit_watcher,
+    recall_text,
+    recap,
+    write_buffer,
+)
 from .backend import MemoryBackend, build_backend, default_backend, has_cognee
 from .config import (
     DEFAULT_DATASET,
@@ -24,8 +32,8 @@ from .config import (
     load_config,
     resolve_hermes_home,
     resolve_local_roots,
+    save_env_vars,
     str_to_bool,
-    write_env_vars,
 )
 from .config import (
     save_config as save_plugin_config,
@@ -34,6 +42,7 @@ from .schemas import (
     CODE_SEARCH_SCHEMA,
     FORGET_SCHEMA,
     RECALL_SCHEMA,
+    RECAP_SCHEMA,
     REMEMBER_SCHEMA,
     SWITCH_DATASET_SCHEMA,
 )
@@ -87,6 +96,57 @@ def _format_turn(user_content: str, assistant_content: str) -> str:
     return f"User: {user_content}\nAssistant: {assistant_content}"
 
 
+#: Capture limits, as in openclaw (applied after redaction).
+_MAX_PARAM_CHARS = 4_000
+_MAX_RETURN_CHARS = 8_000
+_MAX_QA_CHARS = 8_000
+#: Replay budgets for buffered writes: after a write, and at session end.
+_DRAIN_BUDGET_SECS = 20.0
+_FINAL_DRAIN_BUDGET_SECS = 30.0
+
+
+def _text_of(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, default=str)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _clip(value: Any, limit: int) -> str:
+    text = _text_of(value)
+    return f"{text[:limit]}…[truncated]" if len(text) > limit else text
+
+
+def _tool_args(raw: Any) -> dict[str, Any]:
+    """A tool call's arguments as a dict (OpenAI calls carry a JSON string)."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            return {"arguments": raw}
+        return parsed if isinstance(parsed, dict) else {"arguments": parsed}
+    return {}
+
+
+def _tool_error(result: Any) -> str:
+    """The error a tool result reports (Hermes tools answer ``{"error": ...}``), or ""."""
+    data = result
+    if isinstance(result, str):
+        try:
+            data = json.loads(result)
+        except ValueError:
+            return ""
+    if isinstance(data, dict) and data.get("error"):
+        return _text_of(data["error"])
+    return ""
+
+
 def _coerce_result_dict(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -115,6 +175,37 @@ def _coerce_result_dict(value: Any) -> dict[str, Any]:
 #: Tag of the per-prompt memory block: one graph-scope ``only_context`` recall
 #: rendered verbatim (see ``CogneeMemoryProvider._run_layered_prefetch``).
 _MEMORY_LANE = "cognee_memory"
+#: Tag of the session's distilled guidance (``scope=["session_context"]``).
+_GUIDANCE_LANE = "cognee_guidance"
+
+#: After this many prompts in a row whose recall only timed out, each prompt
+#: first spends a short /health probe (openclaw's slow-server probe).
+_SLOW_STREAK_THRESHOLD = 3
+_READY_PROBE_TIMEOUT_SECS = 3.0
+
+
+_BUDGET_EXHAUSTED_MESSAGE = (
+    "Cognee %s improve skipped: the server's LLM budget is exhausted (402); not retrying"
+)
+
+
+def _llm_budget_exhausted(exc: Exception) -> bool:
+    """cognee >= 1.6.3 answers an improve with 402 when the server's LLM budget is
+    spent. The server answered, so it is no breaker failure, and nothing retries."""
+    return getattr(exc, "status", None) == 402
+
+
+def _server_unresponsive(exc: Exception) -> bool:
+    """A write that got no answer: it timed out, or the connection broke after it
+    was opened (``CogneeUnreachable`` from the HTTP transport)."""
+    return _is_timeout(exc) or hasattr(exc, "not_connected")
+
+
+def _is_timeout(exc: Exception) -> bool:
+    if isinstance(exc, (TimeoutError, concurrent.futures.TimeoutError)):
+        return True
+    text = str(exc).lower()
+    return "timed out" in text or "timeout" in text
 
 
 def _readable(value: Any) -> str:
@@ -224,6 +315,19 @@ class CogneeMemoryProvider(MemoryProvider):
         self._turns_seen = 0
         self._turns_with_hits = 0
         self._hits_total = 0
+        # Prompts in a row whose memory recall only timed out (guarded by
+        # _breaker_lock); see _SLOW_STREAK_THRESHOLD.
+        self._slow_streak = 0
+        # Capture writes the server never received wait here (write_buffer).
+        self._write_buffer_path = write_buffer.WRITE_BUFFER_PATH
+        # The last capture-settings error logged, so it is logged once.
+        self._capture_error_logged = ""
+        # Entries stored for the current cognee session since its last
+        # successful improve. A pre-compress or session-end improve with nothing
+        # new is skipped (claude-code's "nothing new" rule): the server's persist
+        # watermark already makes improve incremental, but each call still costs.
+        self._stored_lock = threading.Lock()
+        self._stored_since_improve = 0
 
     @property
     def name(self) -> str:
@@ -340,7 +444,7 @@ class CogneeMemoryProvider(MemoryProvider):
                 env_values["LLM_MODEL"] = llm_model
 
         save_plugin_config(file_values, hermes_home)
-        write_env_vars(Path(hermes_home) / ".env", env_values)
+        save_env_vars(env_values, hermes_home)
 
         if not isinstance(config.get("memory"), dict):
             config["memory"] = {}
@@ -470,6 +574,14 @@ class CogneeMemoryProvider(MemoryProvider):
         self._ensure_dataset()
         self._arm_exit_watcher()
         self._initialized = True
+        problem = capture_policy.capture_pattern_error(
+            capture_policy.policy_from_config(self._config)
+        )
+        if problem:
+            self._warn_capture_error(ValueError(problem))
+        if self._can_buffer() and self._writes_enabled:
+            # Writes an earlier run could not deliver; replayed off the startup path.
+            self._replay_in_background()
 
     def _ensure_dataset(self) -> None:
         """Create-or-return the dataset up front, like the other plugins do.
@@ -550,8 +662,9 @@ class CogneeMemoryProvider(MemoryProvider):
             f"Active ({mode}). Dataset: {self._dataset}.",
             "Use cognee_recall for prior context, cognee_remember for durable facts, "
             "cognee_forget when the user asks to remove Cognee memory, "
-            "cognee_switch_dataset to move this conversation to another dataset, and "
-            "cognee_code_search for structural questions about an indexed repository.",
+            "cognee_switch_dataset to move this conversation to another dataset, "
+            "cognee_code_search for structural questions about an indexed repository, "
+            "and cognee_recap for a standup, digest or timeline of recorded sessions.",
         ]
         # The memory steer — the counterpart of claude-code's COGNEE_PREFER_MEMORY
         # and openclaw's memorySteer: without it the agent reaches for the host's
@@ -597,25 +710,60 @@ class CogneeMemoryProvider(MemoryProvider):
         )
         self._prefetch_thread.start()
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
-        if not self._is_usable() or not self._writes_enabled or self._is_breaker_open():
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
+        """Capture a completed turn: its tool calls as traces, then the turn.
+
+        ``messages`` (Hermes passes the conversation as of the turn) carries the
+        assistant's tool calls and their results; each becomes a ``trace``
+        entry, under the capture policy (``capture_tools`` / ``capture_deny_tools``
+        / secret-file paths) and with secrets redacted, as the claude-code, codex
+        and openclaw plugins capture them. Redaction runs before truncation. A
+        capture setting that cannot be parsed fails closed: nothing is stored.
+
+        A write the server never received is queued and replayed later
+        (``write_buffer``); while the breaker is open, writes go straight to
+        the queue.
+        """
+        if not self._is_usable() or not self._writes_enabled:
+            return
+        settings = capture_policy.policy_from_config(self._config)
+        if not capture_policy.capture_enabled(settings):
+            return
+        cognee_session_id = self._session_cognee_id_for(session_id)
+        dataset = self._dataset
+        try:
+            question = _clip(capture_policy.redact(user_content or "", settings), _MAX_QA_CHARS)
+            answer = _clip(capture_policy.redact(assistant_content or "", settings), _MAX_QA_CHARS)
+            traces = self._turn_traces(messages, settings)
+        except Exception as exc:  # a capture pattern that does not parse: fail closed
+            self._warn_capture_error(exc)
+            return
+        writes: list[tuple[str, dict[str, Any]]] = [("trace", entry) for entry in traces]
+        writes.append(
+            (
+                "qa",
+                # The prompt and the answer in their own fields, as the other
+                # plugins store them: recaps list the prompts, and the timeline
+                # finds a topic in them.
+                {"type": "qa", "question": question, "answer": answer, "context": ""},
+            )
+        )
+
+        if self._is_breaker_open():
+            if self._can_buffer():
+                for kind, entry in writes:
+                    self._buffer_write(dataset, cognee_session_id, kind, entry)
             return
 
-        cognee_session_id = self._session_cognee_id_for(session_id)
-        content = _format_turn(user_content, assistant_content)
-
         def _sync() -> None:
-            try:
-                self._backend.remember_session(
-                    text=content,
-                    session_id=cognee_session_id,
-                    dataset=self._dataset,
-                    timeout=self._timeout("write_timeout", 120),
-                )
-                self._record_success()
-            except Exception as exc:
-                self._record_failure()
-                logger.warning("Cognee session sync failed: %s", exc)
+            self._write_turn(writes, cognee_session_id, dataset)
 
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
@@ -627,6 +775,240 @@ class CogneeMemoryProvider(MemoryProvider):
         )
         self._sync_thread.start()
 
+    def _write_turn(
+        self, writes: list[tuple[str, dict[str, Any]]], cognee_session_id: str, dataset: str
+    ) -> None:
+        """Send one turn's traces and its QA entry under one deadline, one verdict.
+
+        The whole turn gets ``write_timeout``; each write gets what is left of
+        it, so a server that accepts connections but never answers holds this
+        thread for one write timeout, not one per tool call. The first sign that
+        the server is away (a bufferable failure, a timeout or reset, the
+        breaker opening, the deadline passing) ends the turn: what was not sent
+        yet is queued (``write_buffer``), since it certainly never reached the
+        server. A write that timed out is not queued, since the server may have
+        stored it. A write the server answered with an error is dropped and the
+        rest still go, because the server is answering.
+
+        The breaker hears one verdict per turn, as for recall: one failure when
+        the server was away, too slow for the deadline, or refused any write; a
+        success (and a replay of the queue) only when the whole turn was stored.
+        A turn the breaker cut short gives no verdict of its own. A turn whose
+        traces landed but whose QA entry failed is a failure, never a success.
+        """
+        deadline = time.monotonic() + self._timeout("write_timeout", 120)
+        can_buffer = self._can_buffer()
+        pending = list(writes)
+        stored = False
+        refused = False
+        outage: Optional[Exception] = None
+        out_of_time = False
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                out_of_time = True
+                break
+            if self._is_breaker_open():
+                break
+            kind, entry = pending[0]
+            try:
+                self._send_entry(kind, entry, cognee_session_id, dataset, timeout=remaining)
+                pending.pop(0)
+                stored = True
+                self._note_stored(cognee_session_id)
+            except Exception as exc:
+                if kind == "trace" and not can_buffer:
+                    # The in-process SDK has no typed-entry write; the turn
+                    # itself is still stored.
+                    pending.pop(0)
+                    logger.debug("Cognee trace capture unavailable: %s", exc)
+                    continue
+                if can_buffer and write_buffer.is_bufferable_write_error(exc):
+                    outage = exc  # this entry never reached the server: queued below
+                    break
+                pending.pop(0)
+                if _server_unresponsive(exc):
+                    outage = exc
+                    logger.warning(
+                        "Cognee %s write got no answer; not retried, the server may "
+                        "have stored it: %s",
+                        kind,
+                        exc,
+                    )
+                    break
+                refused = True
+                logger.warning("Cognee session sync failed (%s): %s", kind, exc)
+
+        if pending:
+            if can_buffer:
+                for kind, entry in pending:
+                    self._buffer_write(dataset, cognee_session_id, kind, entry)
+                logger.info(
+                    "Cognee buffered %d write(s) until the server is reachable%s",
+                    len(pending),
+                    f": {outage}" if outage else "",
+                )
+            else:
+                logger.warning(
+                    "Cognee dropped %d write(s) of this turn: the server did not answer",
+                    len(pending),
+                )
+
+        if outage is not None or refused or out_of_time:
+            self._record_failure()
+        elif stored and not pending:
+            self._record_success()
+            # The server answers again: replay anything an outage left behind,
+            # on its own thread, so this turn's thread (which sync_turn, forget
+            # and the switches join) is free again at once.
+            self._replay_in_background()
+
+    def _send_entry(
+        self,
+        kind: str,
+        entry: dict[str, Any],
+        cognee_session_id: str,
+        dataset: str,
+        *,
+        timeout: Optional[float] = None,
+    ) -> None:
+        write_timeout = self._timeout("write_timeout", 120)
+        timeout = write_timeout if timeout is None else max(0.1, min(write_timeout, timeout))
+        if kind == "qa" and not self._can_buffer():
+            # The in-process SDK has no typed entries: the turn goes in as one
+            # framed text through remember_session.
+            self._backend.remember_session(
+                text=_format_turn(str(entry.get("question") or ""), str(entry.get("answer") or "")),
+                session_id=cognee_session_id,
+                dataset=dataset,
+                timeout=timeout,
+            )
+            return
+        self._backend.remember_entry(
+            entry=entry, session_id=cognee_session_id, dataset=dataset, timeout=timeout
+        )
+
+    def _turn_traces(
+        self, messages: Optional[list[dict[str, Any]]], settings: dict[str, str]
+    ) -> list[dict[str, Any]]:
+        """``trace`` entries for the tool calls of the turn that just completed.
+
+        The turn starts after the last user message. Raises
+        ``CapturePatternError`` (or ``re.error``) when a capture setting cannot
+        be parsed, so the caller stores nothing.
+        """
+        if not messages:
+            return []
+        start = 0
+        for index, message in enumerate(messages):
+            if isinstance(message, dict) and message.get("role") == "user":
+                start = index + 1
+        turn = [m for m in messages[start:] if isinstance(m, dict)]
+        results = {
+            str(m.get("tool_call_id") or ""): m.get("content")
+            for m in turn
+            if m.get("role") == "tool"
+        }
+        traces: list[dict[str, Any]] = []
+        for message in turn:
+            if message.get("role") != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") or {}
+                name = str(function.get("name") or call.get("name") or "")
+                if not name:
+                    continue
+                params = _tool_args(function.get("arguments"))
+                if capture_policy.is_self_reference(name, params):
+                    continue
+                if not capture_policy.allow_tool(name, params, settings):
+                    continue
+                result = results.get(str(call.get("id") or ""))
+                error = _tool_error(result)
+                redacted = capture_policy.redact(params, settings)
+                traces.append(
+                    {
+                        "type": "trace",
+                        "origin_function": name,
+                        "status": "error" if error else "success",
+                        "method_params": {
+                            str(key): _clip(value, _MAX_PARAM_CHARS)
+                            for key, value in redacted.items()
+                        },
+                        "method_return_value": _clip(
+                            capture_policy.redact(_text_of(result), settings), _MAX_RETURN_CHARS
+                        ),
+                        "error_message": _clip(
+                            capture_policy.redact(error, settings), _MAX_PARAM_CHARS
+                        ),
+                        # LLM feedback per step is expensive on a busy session;
+                        # the server-side AUTO_FEEDBACK + improve pass covers it.
+                        "generate_feedback_with_llm": False,
+                    }
+                )
+        return traces
+
+    def _warn_capture_error(self, exc: Exception) -> None:
+        message = f"Cognee capture is off until the capture settings are fixed: {exc}"
+        if message != self._capture_error_logged:
+            self._capture_error_logged = message
+            logger.warning(message)
+
+    def _can_buffer(self) -> bool:
+        """Whether writes reach a server that outlives this process (HTTP)."""
+        try:
+            return bool(self._backend.connection_info())
+        except Exception:
+            return False
+
+    def _buffer_write(self, dataset: str, session_id: str, kind: str, entry: dict) -> None:
+        try:
+            write_buffer.write_buffer_for(self._write_buffer_path).enqueue(
+                dataset=dataset, session_id=session_id, kind=kind, entry=entry
+            )
+        except Exception as exc:
+            logger.warning("Cognee %s could not be buffered: %s", kind, exc)
+
+    def _drain_write_buffer(self, budget_secs: float, session_id: str = "") -> int:
+        """Replay buffered writes; ``session_id`` limits it to one session."""
+        if not self._can_buffer():
+            return 0
+        buffer = write_buffer.write_buffer_for(self._write_buffer_path)
+        if not session_id and not buffer.maybe_non_empty:
+            return 0
+
+        def send(item: dict[str, Any], remaining: float) -> None:
+            item_session = str(item.get("session_id") or "")
+            # What is left of the drain's budget, never more than one write's.
+            self._backend.remember_entry(
+                entry=item.get("entry") or {},
+                session_id=item_session,
+                dataset=str(item.get("dataset") or self._dataset),
+                timeout=max(0.1, min(self._timeout("write_timeout", 120), remaining)),
+            )
+            self._note_stored(item_session)
+
+        def dropped(item: dict[str, Any], exc: BaseException) -> None:
+            logger.warning(
+                "Cognee dropped a buffered %s for %s: %s",
+                item.get("kind"),
+                item.get("session_id"),
+                exc,
+            )
+
+        try:
+            stored = buffer.drain(
+                send, budget_secs=budget_secs, session_id=session_id, on_drop=dropped
+            )
+        except Exception as exc:
+            logger.warning("Cognee buffered write replay failed: %s", exc)
+            return 0
+        if stored:
+            logger.info("Cognee replayed %d buffered capture write(s)", stored)
+        return stored
+
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         schemas = [RECALL_SCHEMA, REMEMBER_SCHEMA, FORGET_SCHEMA]
         # Config may not be loaded yet when Hermes collects schemas; the
@@ -635,6 +1017,8 @@ class CogneeMemoryProvider(MemoryProvider):
             schemas.append(SWITCH_DATASET_SCHEMA)
         if str_to_bool(self._config.get("code_search_tool"), True):
             schemas.append(CODE_SEARCH_SCHEMA)
+        if str_to_bool(self._config.get("recap_tool"), True):
+            schemas.append(RECAP_SCHEMA)
         return schemas
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
@@ -659,7 +1043,42 @@ class CogneeMemoryProvider(MemoryProvider):
             return self._handle_switch_dataset(args)
         if tool_name == "cognee_code_search":
             return self._handle_code_search(args)
+        if tool_name == "cognee_recap":
+            return self._handle_recap(args)
         return json.dumps({"error": f"Unknown Cognee tool: {tool_name}"})
+
+    def _replay_in_background(self) -> None:
+        """Replay the write buffer on a daemon thread; ``drain`` is single-flight."""
+        if not self._can_buffer():
+            return
+        if not write_buffer.write_buffer_for(self._write_buffer_path).maybe_non_empty:
+            return
+        threading.Thread(
+            target=self._drain_write_buffer,
+            args=(_DRAIN_BUDGET_SECS,),
+            daemon=True,
+            name="cognee-hermes-replay",
+        ).start()
+
+    def _note_stored(self, cognee_session_id: str, count: int = 1) -> None:
+        """Count an entry that reached the current session's cache."""
+        if cognee_session_id and cognee_session_id == self._session_cognee_id:
+            with self._stored_lock:
+                self._stored_since_improve += count
+
+    def _stored_snapshot(self) -> int:
+        with self._stored_lock:
+            return self._stored_since_improve
+
+    def _mark_improved(self, snapshot: int) -> None:
+        """An improve bridged ``snapshot`` entries; later ones still count."""
+        with self._stored_lock:
+            self._stored_since_improve = max(0, self._stored_since_improve - snapshot)
+
+    def _reset_stored(self) -> None:
+        """A different cognee session: nothing of it has been stored yet."""
+        with self._stored_lock:
+            self._stored_since_improve = 0
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         if self._sync_thread and self._sync_thread.is_alive():
@@ -671,12 +1090,22 @@ class CogneeMemoryProvider(MemoryProvider):
             or self._is_breaker_open()
         ):
             return
+        # Turns buffered while the server was away must be in the session cache
+        # before improve bridges it, or they never reach the graph.
+        self._drain_write_buffer(_FINAL_DRAIN_BUDGET_SECS, session_id=self._session_cognee_id)
         # Sessions retired by a forced dataset switch get their deferred bridge
         # before the current session's own close.
         self._bridge_retired_sessions()
-        if self._hand_off_session_close():
+        # Nothing stored since the last improve (a compaction just bridged it,
+        # or the session wrote nothing): the close still unregisters, but no
+        # improve is paid for.
+        nothing_new = self._stored_snapshot() == 0
+        if nothing_new:
+            logger.debug("Cognee session-end improve skipped: nothing new since the last one")
+        if self._hand_off_session_close(improve=not nothing_new):
             return
-        self._improve_inline()
+        if not nothing_new:
+            self._improve_inline()
 
     def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
         """Bridge the session into the graph before Hermes compresses it away.
@@ -709,6 +1138,13 @@ class CogneeMemoryProvider(MemoryProvider):
                 # The latest turn has to be in the session cache before it is bridged.
                 if sync_thread and sync_thread.is_alive():
                     sync_thread.join(timeout=10.0)
+                # So must the turns buffered while the server was away.
+                self._drain_write_buffer(_DRAIN_BUDGET_SECS, session_id=session_id)
+                snapshot = self._stored_snapshot()
+                if snapshot == 0:
+                    # Nothing stored since the last improve: nothing to bridge.
+                    logger.debug("Cognee pre-compress improve skipped: nothing new")
+                    return
                 try:
                     self._backend.improve(
                         dataset=dataset,
@@ -717,7 +1153,11 @@ class CogneeMemoryProvider(MemoryProvider):
                         timeout=self._timeout("improve_timeout", 300),
                     )
                     self._record_success()
+                    self._mark_improved(snapshot)
                 except Exception as exc:
+                    if _llm_budget_exhausted(exc):
+                        logger.warning(_BUDGET_EXHAUSTED_MESSAGE, "pre-compress")
+                        return
                     self._record_failure()
                     logger.warning("Cognee pre-compress improve failed: %s", exc)
 
@@ -729,7 +1169,7 @@ class CogneeMemoryProvider(MemoryProvider):
             logger.warning("Cognee pre-compress improve failed: %s", exc)
         return ""
 
-    def _hand_off_session_close(self) -> bool:
+    def _hand_off_session_close(self, *, improve: bool = True) -> bool:
         """Give improve-then-unregister to a detached worker. True when it took them.
 
         Two requirements that cannot both hold in this process: the user's exit
@@ -751,7 +1191,7 @@ class CogneeMemoryProvider(MemoryProvider):
                 api_key=str(info.get("api_key") or ""),
                 session_id=self._session_cognee_id,
                 dataset=self._dataset,
-                improve=True,
+                improve=improve,
                 improve_timeout=self._timeout("improve_timeout", 300),
             )
         except Exception as exc:
@@ -770,6 +1210,7 @@ class CogneeMemoryProvider(MemoryProvider):
         shut down.
         """
         background = str_to_bool(self._config.get("improve_background"), False)
+        snapshot = self._stored_snapshot()
         try:
             self._backend.improve(
                 dataset=self._dataset,
@@ -778,11 +1219,15 @@ class CogneeMemoryProvider(MemoryProvider):
                 timeout=self._timeout("improve_timeout", 300),
             )
             self._record_success()
+            self._mark_improved(snapshot)
             # The bridge ran; a crash after this point should not improve again.
             # The watcher stays armed for the unregister half.
             if self._watcher_state_path is not None:
                 exit_watcher.update(self._watcher_state_path, improve=False)
         except Exception as exc:
+            if _llm_budget_exhausted(exc):
+                logger.warning(_BUDGET_EXHAUSTED_MESSAGE, "session-end")
+                return
             self._record_failure()
             logger.warning("Cognee session-end improve failed: %s", exc)
 
@@ -802,6 +1247,7 @@ class CogneeMemoryProvider(MemoryProvider):
         self._dataset = self._default_dataset
         self._switch_counter = 0
         self._session_cognee_id = self._build_cognee_session_id(new_session_id, **kwargs)
+        self._reset_stored()
         self._apply_dataset_override()
         if self._watcher_state_path is not None and not self._close_handed_off:
             # Re-point the crash insurance at the new session (and re-enable the
@@ -847,6 +1293,16 @@ class CogneeMemoryProvider(MemoryProvider):
             return
         metadata = dict(metadata or {})
         source = metadata.get("write_origin") or "hermes_memory_tool"
+        # A mirror of Hermes' own memory writes is automatic capture, so the
+        # capture policy's redaction applies (explicit cognee_remember is not).
+        settings = capture_policy.policy_from_config(self._config)
+        if not capture_policy.capture_enabled(settings):
+            return
+        try:
+            content = capture_policy.redact(content, settings)
+        except Exception as exc:  # a redaction pattern that does not parse: fail closed
+            self._warn_capture_error(exc)
+            return
         payload = f"Hermes {target} memory ({action}, {source}): {content}"
 
         def _sync() -> None:
@@ -948,15 +1404,16 @@ class CogneeMemoryProvider(MemoryProvider):
         Memory is read from the graph only. The session cache (the server's
         ``session``, ``trace`` and ``session_context`` scopes) and the ``auto``
         scope that folds it in are never requested — those entries are noise
-        next to the cognified graph. The session id still travels: on cognee
-        >= 1.6.0 the graph item's prompt then carries this conversation's
-        history, and an explicit graph scope never returns raw session entries.
+        next to the cognified graph. No session id travels, as in openclaw's
+        ``memory_search``: on cognee >= 1.6.0 it would put this conversation's
+        own turns, which Hermes already holds, into the item's prompt.
         ``search_type`` is the caller's override or None for the query
-        classifier.
+        classifier. ``session_id`` is accepted for call-site compatibility.
         """
+        del session_id
         return self._backend.recall(
             query=query,
-            session_id=session_id,
+            session_id=None,
             datasets=[self._dataset],
             top_k=top_k,
             auto_route=self._auto_route,
@@ -966,11 +1423,17 @@ class CogneeMemoryProvider(MemoryProvider):
         )
 
     def _remember_permanent(self, content: str, dataset: str) -> Any:
+        kwargs: dict[str, Any] = {}
+        # Opt-in (#428): unset leaves chunking to the server, as before.
+        chunk_size = self._char_limit("chunk_size", 0)
+        if chunk_size > 0:
+            kwargs["chunk_size"] = chunk_size
         return self._backend.remember_permanent(
             text=content,
             dataset=dataset,
             session_ids=[self._session_cognee_id],
             timeout=self._timeout("write_timeout", 120),
+            **kwargs,
         )
 
     # -- layered per-prompt recall -------------------------------------------
@@ -1020,36 +1483,56 @@ class CogneeMemoryProvider(MemoryProvider):
         }
 
     @staticmethod
-    def _is_graph_not_built(exc: Exception, scope: Any) -> bool:
-        """A 404 on the graph scope means nobody has cognified the dataset yet —
-        routine on a fresh install, so it must not read as a recall failure."""
-        return scope == ["graph"] and getattr(exc, "status", None) == 404
+    def _is_not_found(exc: Exception) -> bool:
+        """A 404 on the graph or guidance scope means nothing was cognified (or
+        distilled) yet — routine on a fresh install, so it must not read as a
+        recall failure."""
+        return getattr(exc, "status", None) == 404
 
     def _run_layered_prefetch(self, query: str, session_id: str, generation: int) -> None:
-        """One memory request per prompt, plus the code lane when it is armed.
+        """Up to three lanes per prompt, injecting only what Hermes does not have.
 
-        The memory lane is a single graph-scope ``HYBRID_COMPLETION`` recall
-        with ``only_context`` and this conversation's ``session_id``. On cognee
-        >= 1.6.0 that returns one graph item per dataset whose ``text`` is the
-        full LLM input the completion would have received: the session's
-        conversation history, the question with the retrieved context rendered
-        through the retriever's user template, and the session guidance block.
-        The server builds the history and guidance layers from ``session_id``,
-        so it must always travel; without it the item is bare context. Older
-        servers return the bare retrieval context in ``text``, and the LLM is
-        never called on either. The separate ``system_prompt`` field (the
-        retriever's task template) is deliberately not read.
+        * Memory: one graph-scope ``HYBRID_COMPLETION`` recall with
+          ``only_context``, sent WITHOUT the session id (SDK-904). On cognee
+          >= 1.6.0 the item's ``text`` is the full LLM input the completion would
+          have read; with a session id that input also carries this
+          conversation's recent turns, which Hermes already holds and which were
+          most of a mid-session payload. :func:`recall_text.trim_recall_text`
+          keeps only the retrieved context: the question template goes,
+          passages recorded in this session go, each passage is capped at
+          ``recall_passage_chars`` and the item at ``recall_context_chars``.
+          Text that does not parse (an older server's bare context) is injected
+          whole.
+        * Guidance: the session's distilled guidance, from its own
+          ``scope=["session_context"]`` request with the session id against the
+          capture dataset, injected as ``<cognee_guidance>``. A 404 means none
+          exists yet.
+        * Code: the deterministic ``code_query`` lane when a prompt arms it.
 
-        That one item replaces the earlier per-scope fan-out (session cache,
-        trace lessons, agent guidance as three more requests). The code lane
-        stays separate: it is a deterministic ``code_query`` against a
-        different dataset. Lanes still share one deadline and are dispatched
-        together; a failure in one never discards the other.
+        The lanes are dispatched together under one deadline; a lane that fails
+        or misses it is dropped without costing the others. ``recall_context_chars``
+        then caps the whole injection (guidance first, then memory, then code),
+        the same rules as the claude-code, codex and openclaw plugins.
         """
         budget = self._config.get("recall_budget")
         deadline = time.monotonic() + (20.0 if budget is None else float(budget))
         recall_timeout = self._timeout("recall_timeout", 120)
         top_k = min(self._top_k, 5)
+        passage_chars = self._char_limit("recall_passage_chars", recall_text.DEFAULT_PASSAGE_CHARS)
+        context_chars = self._char_limit("recall_context_chars", recall_text.DEFAULT_CONTEXT_CHARS)
+
+        # Slow-server probe: after a few prompts in a row whose recall only
+        # timed out, a short /health check decides whether to try at all,
+        # instead of spending the whole budget on a server that is not
+        # answering. Any answered recall ends the streak.
+        if self._slow_streak >= _SLOW_STREAK_THRESHOLD and not self._server_answers_quickly():
+            logger.info(
+                "Cognee server not responding (%d slow recalls in a row); skipping recall",
+                self._slow_streak,
+            )
+            with self._prefetch_lock:
+                self._turns_seen += 1
+            return
 
         lanes: list[tuple[str, dict[str, Any]]] = []
         code_lane = self._code_lane(query)
@@ -1067,7 +1550,19 @@ class CogneeMemoryProvider(MemoryProvider):
         # HYBRID_COMPLETION combines BM25 + vector + graph retrieval; with
         # only_context the LLM completion is skipped server-side and the item's
         # text is the prompt that completion would have read.
-        lanes.append((_MEMORY_LANE, {"scope": ["graph"], "query_type": "HYBRID_COMPLETION"}))
+        lanes.append(
+            (
+                _MEMORY_LANE,
+                {"scope": ["graph"], "query_type": "HYBRID_COMPLETION", "session_id": None},
+            )
+        )
+        if session_id:
+            lanes.append(
+                (
+                    _GUIDANCE_LANE,
+                    {"scope": ["session_context"], "session_id": session_id},
+                )
+            )
 
         # Same deadline for every lane: min(per-call timeout, budget left).
         # Below the floor a call cannot return anything useful, so nothing is
@@ -1082,7 +1577,7 @@ class CogneeMemoryProvider(MemoryProvider):
             try:
                 results = self._backend.recall(
                     query=query,
-                    session_id=session_id,
+                    session_id=spec.get("session_id"),
                     datasets=spec.get("datasets") or [self._dataset],
                     top_k=top_k,
                     auto_route=True,
@@ -1107,45 +1602,107 @@ class CogneeMemoryProvider(MemoryProvider):
             ) as pool:
                 outcomes = list(pool.map(_run_lane, [spec for _label, spec in lanes]))
 
-        blocks: list[str] = []
-        hits = 0
+        memories: list[str] = []
+        code_blocks: list[str] = []
+        guidance = ""
+        item_guidance = ""
         answered = False
         hard_failures = 0
-        # Fold the lanes in canonical order so the rendered blocks read the same
-        # whichever request answered first.
+        memory_timed_out = False
         for (label, spec), (results, exc) in zip(lanes, outcomes):
             if exc is not None:
-                if self._is_graph_not_built(exc, spec["scope"]):
+                if self._is_not_found(exc) and spec["scope"] in (["graph"], ["session_context"]):
+                    # Nothing cognified yet, or no guidance yet: routine on a
+                    # fresh install, not a recall failure.
                     answered = True
                     continue
+                if label == _GUIDANCE_LANE:
+                    # Guidance is a side lane: its failure says nothing about
+                    # whether memory works, so it never feeds the breaker.
+                    logger.debug("Cognee guidance recall failed: %s", exc)
+                    continue
+                if label == _MEMORY_LANE and _is_timeout(exc):
+                    memory_timed_out = True
                 hard_failures += 1
                 logger.debug("Cognee recall lane %s failed: %s", label, exc)
                 continue
             answered = True
             if label == _MEMORY_LANE:
-                lines = self._memory_lane_texts(results)
+                for text in self._memory_lane_texts(results):
+                    context, item_guide, stats = recall_text.trim_recall_text(
+                        text,
+                        query,
+                        session_id,
+                        passage_chars=passage_chars,
+                        context_chars=context_chars,
+                    )
+                    event = "trimmed" if stats.get("parsed") else "unparsed"
+                    logger.debug("cognee recall_context_%s %s", event, json.dumps(stats))
+                    if item_guide and not item_guidance:
+                        item_guidance = item_guide
+                    if context.strip():
+                        memories.append(context.strip())
+            elif label == _GUIDANCE_LANE:
+                guidance = "\n\n".join(self._memory_lane_texts(results)).strip()
             else:
                 lines = self._format_recall_lines(results, limit=top_k)
-            if not lines:
-                continue
-            hits += len(lines)
-            blocks.append(f"<{label}>\n" + "\n".join(lines) + f"\n</{label}>")
+                if lines:
+                    code_blocks.append(f"<{label}>\n" + "\n".join(lines) + f"\n</{label}>")
 
         # One verdict per turn, not per lane: a single dead server must not
-        # feed the breaker five failures every prompt, and one healthy lane is
-        # proof the backend is up.
+        # feed the breaker several failures every prompt, and one healthy lane
+        # is proof the backend is up.
         if answered:
             self._record_success()
         elif hard_failures:
             self._record_failure()
+        with self._breaker_lock:
+            if memory_timed_out and not answered:
+                self._slow_streak += 1
+            elif answered:
+                self._slow_streak = 0
+
+        # A guidance block can trail the graph item even without a session id;
+        # the guidance request renders the same lines, so it wins.
+        guidance = guidance or item_guidance.strip()
+        capped = recall_text.cap_total(
+            [guidance, *memories, *code_blocks],
+            context_chars,
+            lambda index: index > len(memories),
+        )
+        kept_guidance = capped[0]
+        kept_memories = [text for text in capped[1 : 1 + len(memories)] if text.strip()]
+        kept_code = [block for block in capped[1 + len(memories) :] if block.strip()]
+
+        blocks = [f"<{_MEMORY_LANE}>\n{text}\n</{_MEMORY_LANE}>" for text in kept_memories]
+        blocks.extend(kept_code)
+        if kept_guidance.strip():
+            blocks.append(f"<{_GUIDANCE_LANE}>\n{kept_guidance.strip()}\n</{_GUIDANCE_LANE}>")
+        hits = len(kept_memories) + sum(block.count("\n- ") for block in kept_code)
 
         with self._prefetch_lock:
             self._turns_seen += 1
             if blocks:
-                self._turns_with_hits += 1
-                self._hits_total += hits
+                if hits:
+                    self._turns_with_hits += 1
+                    self._hits_total += hits
                 if generation == self._prefetch_generation:
-                    self._prefetch_result = self._hit_header(hits) + "\n\n".join(blocks)
+                    header = self._hit_header(hits) if hits else ""
+                    self._prefetch_result = header + "\n\n".join(blocks)
+
+    def _char_limit(self, key: str, default: int) -> int:
+        """A non-negative character limit from config; 0 disables it."""
+        try:
+            value = int(self._config.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return value if value >= 0 else default
+
+    def _server_answers_quickly(self) -> bool:
+        try:
+            return bool(self._backend.probe_health(timeout=_READY_PROBE_TIMEOUT_SECS))
+        except Exception:
+            return False
 
     def _handle_recall(self, args: dict[str, Any]) -> str:
         query = str(args.get("query") or "").strip()
@@ -1402,6 +1959,7 @@ class CogneeMemoryProvider(MemoryProvider):
         self._dataset = dataset
         self._switch_counter = counter
         self._session_cognee_id = f"{self._session_cognee_id}__{counter}"
+        self._reset_stored()
 
     def _handle_switch_dataset(self, args: dict[str, Any]) -> str:
         action = str(args.get("action") or "").strip().lower()
@@ -1506,6 +2064,7 @@ class CogneeMemoryProvider(MemoryProvider):
         self._switch_counter += 1
         base = self._build_cognee_session_id(self._session_id)
         self._session_cognee_id = f"{base}__{self._switch_counter}"
+        self._reset_stored()
         self._dataset = target
         dataset_overrides.save_override(self._session_id, target, self._switch_counter)
         with self._prefetch_lock:
@@ -1636,6 +2195,38 @@ class CogneeMemoryProvider(MemoryProvider):
             return json.dumps({"error": f"Cognee code search failed: {exc}"})
         items = [_coerce_result_dict(item) for item in results]
         return json.dumps({"dataset": dataset, "results": items, "count": len(items)})
+
+    def _handle_recap(self, args: dict[str, Any]) -> str:
+        """A standup, digest or timeline of this dataset's recorded sessions.
+
+        Only sessions recorded into the active dataset are listed, so on a
+        shared server a recap never shows another user's conversations;
+        ``all_sessions`` adds other clients' sessions in that dataset.
+        """
+        kind = str(args.get("kind") or "").strip().lower()
+        if kind not in recap.RECAP_KINDS:
+            return json.dumps({"error": f"kind must be one of {', '.join(recap.RECAP_KINDS)}"})
+        projects = args.get("projects")
+        try:
+            dataset_ids = recap.resolve_dataset_ids(self._backend, [self._dataset])
+            result = recap.run_recap(
+                recap.BackendRecapApi(self._backend),
+                kind=kind,
+                dataset_ids=dataset_ids,
+                datasets=[self._dataset],
+                topic=str(args.get("topic") or ""),
+                since=str(args.get("since") or ""),
+                projects=[p for p in projects if isinstance(p, str)]
+                if isinstance(projects, list)
+                else None,
+                all_sessions=args.get("all_sessions") is True,
+                session_prefixes=(f"{self._config.get('session_prefix') or 'hermes'}_",),
+            )
+        except Exception as exc:
+            return json.dumps({"kind": kind, "error": f"Cognee recap failed: {exc}"})
+        return json.dumps(
+            {"kind": kind, "markdown": result["markdown"], "warnings": result["warnings"]}
+        )
 
     def _normalize_recall_item(self, item: Any) -> dict[str, Any]:
         data = _coerce_result_dict(item)

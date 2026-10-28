@@ -25,11 +25,16 @@ Python package with the `hermes_agent.plugins` entry point.
 
 ## Features
 
-- Stores each completed Hermes turn in Cognee session memory.
-- Recalls memory per prompt with a single request: one `<cognee_memory>`
-  block holding the session history, retrieved graph context and session
-  guidance (see [Per-prompt memory block](#per-prompt-memory-block)), with a
-  plain-words hit counter on top.
+- Stores each completed Hermes turn in Cognee session memory, and the turn's
+  tool calls as traces, under a capture policy that never stores calls touching
+  secret files and redacts secrets from what it stores (see
+  [Capture policy and redaction](#capture-policy-and-redaction)).
+- Queues turns the server never received (it was booting, or down) and replays
+  them once it answers again, so a cold start loses nothing.
+- Recalls memory per prompt: the retrieved graph context, trimmed to what
+  Hermes does not already have, plus the session's distilled guidance (see
+  [Per-prompt memory block](#per-prompt-memory-block)), with a plain-words hit
+  counter on top.
 - Uses `cognee_recall` for explicit search, `cognee_remember` for durable
   graph memory.
 - Exposes `cognee_forget` for user-directed, per-document deletion ("forget
@@ -40,7 +45,15 @@ Python package with the `hermes_agent.plugins` entry point.
 - Indexes repositories into a deterministic code graph (`hermes cognee
   index-repo`) and answers structural code questions exactly via
   `cognee_code_search`, plus an identifier-gated code recall lane.
-- Runs `cognee.improve()` at Hermes session end to bridge session memory into the graph.
+- Recaps recorded sessions with `cognee_recap` and `hermes cognee
+  standup|digest|timeline`: what was worked on and left open, the lessons
+  distilled into memory, or a dated timeline of one topic.
+- Runs `cognee.improve()` at Hermes session end to bridge session memory into
+  the graph, and before Hermes compresses a long conversation, so turns
+  compressed away still reach the graph.
+- `cognee_remember` returns as soon as the server has the text; the graph is
+  built in the background, so a slow LLM never turns a stored fact into a
+  reported timeout.
 - Mirrors explicit Hermes memory writes through `on_memory_write`, and steers
   the agent to prefer Cognee over Hermes' built-in memory files.
 - Supports local embedded Cognee and remote Cognee service mode.
@@ -250,14 +263,17 @@ turns into the permanent graph. Two consequences worth knowing:
 
 By default this plugin joins the same memory the Claude Code, Codex and OpenClaw
 cognee plugins share: the same dataset (`agent_sessions`), the same local storage
-(`~/.cognee/{data,system}`), the same server port (8011) and the same minted API
-key (`~/.cognee-plugin/api_key.json`). Whichever plugin boots the server first,
+(`~/.cognee/{data,system}`), the same server port (8011) and the same API key —
+which this plugin looks up on the local server at each session start rather than
+reading the others' key file. Whichever plugin boots the server first,
 the rest attach to it — and a fact remembered in Claude Code is recallable in
 Hermes, and vice versa. To keep Hermes (or one Hermes profile) apart instead, give
 it its own `COGNEE_PLUGIN_DATASET`, or for full isolation its own
 `COGNEE_DATA_ROOT` / `COGNEE_SYSTEM_ROOT` *and* `COGNEE_LOCAL_PORT` — a server
 belongs to whoever reaches its port first, so a private store needs a private
-port.
+port. The same goes for its LLM key: a server shared by several profiles keeps
+the key of the profile that started it, so profiles that must not share an LLM
+bill need their own `COGNEE_LOCAL_PORT` too.
 
 The per-mode settings below live in `~/.hermes/.env` (the wizard puts them
 there; you can also edit the file by hand).
@@ -336,6 +352,15 @@ LLM_API_KEY=sk-...
 | `write_timeout` | `COGNEE_WRITE_TIMEOUT` | `120` (seconds) |
 | `improve_timeout` | `COGNEE_IMPROVE_TIMEOUT` | `300` (seconds) |
 | `recall_budget` | `COGNEE_RECALL_BUDGET` | `20` (seconds, bounds the per-prompt recall) |
+| `recall_passage_chars` | `COGNEE_RECALL_PASSAGE_CHARS` | `2000` (per recalled passage; `0` = no cap) |
+| `recall_context_chars` | `COGNEE_RECALL_CONTEXT_CHARS` | `12000` (the whole injection; `0` = no cap) |
+| `capture` | `COGNEE_CAPTURE` | `true` (automatic capture of turns and tool calls) |
+| `capture_tools` | `COGNEE_CAPTURE_TOOLS` | `*` (tool allow list) |
+| `capture_deny_tools` | `COGNEE_CAPTURE_DENY_TOOLS` | empty (tool deny list) |
+| `capture_deny_paths` | `COGNEE_CAPTURE_DENY_PATHS` | empty (extra secret-file globs) |
+| `capture_redact` | `COGNEE_CAPTURE_REDACT` | `true` |
+| `capture_redact_patterns` | `COGNEE_CAPTURE_REDACT_PATTERNS` | empty (extra regexes, one per line) |
+| `chunk_size` | `COGNEE_CHUNK_SIZE` | unset (server default; tokens per chunk for `cognee_remember`) |
 | `memory_steer` | `COGNEE_MEMORY_STEER` | `true` |
 | `memory_steer_text` | `COGNEE_MEMORY_STEER_TEXT` | built-in wording |
 | `memory_hits` | `COGNEE_MEMORY_HITS` | `true` |
@@ -343,6 +368,7 @@ LLM_API_KEY=sk-...
 | `code_search_tool` | `COGNEE_CODE_SEARCH_TOOL` | `true` |
 | `code_graph_recall` | `COGNEE_CODE_GRAPH_RECALL` | `true` |
 | `code_datasets` | `COGNEE_CODE_DATASETS` | empty (comma-separated extra code datasets) |
+| `recap_tool` | `COGNEE_RECAP_TOOL` | `true` |
 | `update_check` | `COGNEE_UPDATE_CHECK` | `true` (CLI-only PyPI check) |
 | `update_check_interval` | `COGNEE_UPDATE_CHECK_INTERVAL` | `3600` (seconds) |
 
@@ -427,26 +453,117 @@ raises the deadline.
 
 ### Per-prompt memory block
 
-Every prompt triggers exactly one memory request: `scope=["graph"]`,
-`search_type=HYBRID_COMPLETION`, `only_context=true`, with the conversation's
-`session_id` (plus a separate deterministic code-graph request when the
-[code recall lane](#code-graph-index-a-repository) is armed). No LLM is called
-on the server for it. On cognee >= 1.6.0 the server answers with one graph
-item per dataset whose `text` is the full input the completion would have
-received — the session's conversation history, the question with the retrieved
-context, then the session guidance block — and the plugin injects that string
-verbatim as the `<cognee_memory>` block, untruncated. Older servers (1.5.x)
-return the bare retrieval context in `text`, which is injected the same way.
-The item's `system_prompt` field is ignored.
+Every prompt makes up to three requests, dispatched together under one deadline
+(`recall_budget`); none of them calls an LLM on the server:
 
-Memory is read from the knowledge graph only, on the per-prompt block and on the
-explicit `cognee_recall` tool alike: the server's session-cache scopes
-(`session`, `trace`, `session_context`) and its `auto` scope, which folds them
-in, are never requested. Turns are still written to the session cache — that is
-what `improve()` promotes into the graph at session end — but they are not
-searched as raw entries; on cognee >= 1.6.0 the graph item's prompt already
-carries this conversation's history because the session id travels with every
-recall. `cognee_recall` takes `query`, an optional `search_type` and `top_k`.
+- **Memory**: `scope=["graph"]`, `search_type=HYBRID_COMPLETION`,
+  `only_context=true`, and **no session id**. On cognee >= 1.6.0 the server
+  answers with the full input its completion would have received; with a session
+  id that input would also carry this conversation's recent turns, which Hermes
+  already has. The plugin keeps only the retrieved context: the question
+  template and history go, passages recorded in this very session go, each
+  passage is capped at `recall_passage_chars` (cut at a paragraph break), and
+  entity lines that say nothing are pruned. Text it cannot parse (an older
+  server's bare context) is injected whole. Injected as `<cognee_memory>`.
+- **Guidance**: `scope=["session_context"]` with the session id, against the
+  active dataset: the lessons the server distilled from this session, injected as
+  `<cognee_guidance>`. None yet is normal and costs nothing.
+- **Code**: the deterministic code-graph lane, when the
+  [code recall lane](#code-graph-index-a-repository) is armed.
+
+`recall_context_chars` then caps the whole injection: guidance first, then
+memory, then code facts; the block that crosses it is cut at a line and marked.
+A lane that fails or misses the deadline is dropped without costing the others.
+The trimming rules are shared with the Claude Code, Codex and OpenClaw plugins
+(`integrations/conformance/recall_text_cases.json`).
+
+After three prompts in a row whose recall only timed out, each prompt first
+spends a 3-second `/health` probe and skips recall while the server does not
+answer, instead of waiting out the whole budget. Any answered recall ends it.
+
+The explicit `cognee_recall` tool reads the graph the same way, without the
+session id. It takes `query`, an optional `search_type` and `top_k`. The raw
+session-cache scopes (`session`, `trace`) and the `auto` scope are never
+requested: turns and traces are written to the session cache, which `improve()`
+promotes into the graph at session end, but they are not searched as raw entries.
+
+### Capture policy and redaction
+
+Each completed turn is stored as a `qa` entry and each of its tool calls as a
+`trace` entry (tool name, arguments, result, status), read from the
+conversation Hermes hands the provider. The rules are the ones the Claude Code,
+Codex and OpenClaw plugins use (`integrations/conformance/capture_policy_cases.json`):
+
+- `capture_tools` / `capture_deny_tools` choose which tool calls are captured:
+  a name, an fnmatch glob, or `tool(prefix:*)` matched against the first word of
+  a shell command (`terminal(git:*)`), case-insensitively. Separate entries with
+  `|`, or give a JSON array.
+- A call whose path arguments or shell command name `.env*`, `*.pem`, `*.key`,
+  ssh or cloud credentials, `secrets.*` or `credentials.*` (plus
+  `capture_deny_paths`) is never captured. Neither is a call to the cognee tools
+  themselves, or a shell command that mentions cognee.
+- `capture_redact` (on by default) scrubs private keys, bearer and basic tokens,
+  database URLs, credential assignments, vendor keys, AWS key ids, bcrypt hashes
+  and secret-named fields from captured turns, tool calls and mirrored Hermes
+  memory writes, plus `capture_redact_patterns`. Redaction runs before
+  truncation (arguments at 4,000 characters, results and turns at 8,000).
+- A pattern the plugin cannot parse fails closed: nothing is captured until it is
+  fixed, and the Hermes log says why.
+- `capture=false` turns automatic capture off. What you store with
+  `cognee_remember` is never filtered or redacted.
+
+Tool traces need the HTTP transport (the default); the in-process SDK transport
+stores the turns only.
+
+### Writes the server never received
+
+A turn or trace that cannot reach the server because the connection could not
+be opened (refused while it boots, host unreachable, DNS failure) or because it
+answered 503 is queued in `~/.cognee-plugin/hermes/pending-entries.json` (newest
+500, kept a week). The queue is replayed after the next successful write, when a
+session starts, and, for the ending session, before its session-end `improve()`.
+A write that timed out or was cut off mid-request is not replayed, since the
+server may already have stored it. While the circuit breaker is open, writes go
+straight to the queue.
+
+### What this plugin runs, stores and sends
+
+- **Runs**: in local mode, a cognee server (`uvicorn cognee.api.client:app`) on
+  `127.0.0.1:8011` from the installed `cognee` package, in
+  `~/.cognee-plugin/hermes/`, with its output in
+  `~/.cognee-plugin/hermes/server.log`; a detached exit watcher per Hermes
+  process that closes the session if Hermes cannot. The server gets its
+  settings from Hermes (the active profile's secrets and environment), not from a
+  `.env` in the directory you start Hermes from; the watcher gets the API key
+  from the plugin when it starts and reads no key file.
+- **Stores locally**: `~/.cognee/` (the shared cognee data, unless you move it),
+  and under `~/.cognee-plugin/hermes/`: the write queue, dataset
+  switches, indexed code graphs, exit-watcher state and the update-check cache.
+  Plugin settings are in `$HERMES_HOME/cognee.json`.
+- **Sends** to the cognee server it is configured for (local, or
+  `COGNEE_BASE_URL`): each turn and its tool calls (after the capture policy and
+  redaction), your prompt as the recall query, mirrored Hermes memory writes,
+  what you ask it to remember, forget or index, and `improve()` at session end
+  and before each context compression. The server, not the plugin, calls your LLM and embedding
+  providers; what else the cognee server sends is governed by its own settings.
+  The plugin's only other request is the CLI's update check, which asks PyPI
+  for the latest release version at most once an hour.
+
+### Server settings and `.env` files
+
+cognee >= 1.6.2 loads the first `.env` it finds walking up from its working
+directory and lets it override the environment. The server this plugin starts
+therefore runs in `~/.cognee-plugin/hermes/`, so a `.env` in the directory you
+start Hermes from never reaches it.
+
+Keys and settings come through Hermes only: `hermes memory setup` stores
+`COGNEE_API_KEY`, `LLM_API_KEY` and `COGNEE_BASE_URL` in the profile's `.env`
+through Hermes' own writer, and the plugin reads them back with Hermes'
+`get_secret`, which picks the right profile when one gateway serves several.
+The plugin never opens a `.env` file itself. **`~/.cognee/.env`, the file the
+Claude Code, Codex and OpenClaw plugins share, is not read by this plugin:** if
+your keys live only there, run `hermes memory setup` once, or put them in
+Hermes' `.env`.
 
 ## Code graph: index a repository
 
@@ -487,7 +604,20 @@ hermes cognee setup
 hermes cognee config
 hermes cognee install
 hermes cognee index-repo <path-or-url> [--dataset D] [--index-vectors] [--wait SECONDS]
+hermes cognee standup  [--since 24h] [--projects P,…] [--all-sessions] [--json]
+hermes cognee digest   [--since 7d] [--max-learnings N] [--json]
+hermes cognee timeline <topic> [--since 30d] [--json]
 ```
+
+`standup`, `digest` and `timeline` print a recap of the sessions recorded into
+the configured dataset (`--dataset` picks another): what was worked on and left
+open, the lessons the server distilled into memory, or a dated timeline of one
+topic. Only sessions recorded into that dataset are listed, so on a shared server
+a recap never shows other users' conversations; `--all-sessions` adds other
+clients' sessions in it (Claude Code, Codex). The server cannot filter sessions
+by dataset, so a recap reads up to 2,500 of the newest sessions and says so when
+it had more. The same recaps are available to the agent as the `cognee_recap`
+tool.
 
 For pip installations, `status` and `version` include an update hint when PyPI has a newer release
 (checked at most once per `COGNEE_UPDATE_CHECK_INTERVAL`, never from a live

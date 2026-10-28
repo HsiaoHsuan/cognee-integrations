@@ -102,6 +102,8 @@ these through the environment); it expects
   `integrations/tests/tests/unit/test_recall_text_conformance.py`
 - openclaw: `integrations/openclaw/__tests__/unit/test_recall_text.ts`
   (port in `integrations/openclaw/src/recall-text.ts`)
+- hermes-agent: `integrations/hermes-agent/tests/test_recall_text_conformance.py`
+  (port in `integrations/hermes-agent/cognee_integration_hermes/recall_text.py`)
 
 When `_recall_text.py` changes on purpose, regenerate the table from it and
 make the port pass again.
@@ -153,3 +155,7 @@ the lowercased name too.
 - claude-code, codex and antigravity:
   `integrations/tests/tests/unit/test_capture_policy_conformance.py`
 - openclaw: `integrations/openclaw/__tests__/unit/test_capture_policy.ts`
+- hermes-agent: `integrations/hermes-agent/tests/test_capture_policy_conformance.py`
+  (port in `integrations/hermes-agent/cognee_integration_hermes/capture_policy.py`;
+  settings come from the plugin config, falling back to the `COGNEE_CAPTURE_*`
+  variables, and tool names match case-insensitively as in openclaw)

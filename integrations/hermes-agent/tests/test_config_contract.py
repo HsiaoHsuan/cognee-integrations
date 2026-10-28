@@ -10,9 +10,9 @@ Run standalone with ``python3 tests/test_config_contract.py``.
 import contextlib
 import json
 import os
-import stat
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -250,57 +250,84 @@ class TestStrToBool(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 
-class TestWriteEnvVars(unittest.TestCase):
-    def test_creates_the_file_with_owner_only_permissions(self):
-        with _TmpHome() as home:
-            env_path = home / ".env"
-            config_mod.write_env_vars(env_path, {"COGNEE_API_KEY": "secret"})
-            mode = stat.S_IMODE(env_path.stat().st_mode)
-        self.assertEqual(mode, 0o600)
+class _FakeHermesConfig:
+    """Stand-ins for hermes_cli.config / hermes_constants, recording each call."""
 
-    def test_updates_an_existing_key_in_place(self):
-        with _TmpHome() as home:
-            env_path = home / ".env"
-            env_path.write_text("COGNEE_API_KEY=old\n", encoding="utf-8")
-            config_mod.write_env_vars(env_path, {"COGNEE_API_KEY": "new"})
-            lines = env_path.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines, ["COGNEE_API_KEY=new"])
+    def __init__(self, refuse=()):
+        self.saved: list[tuple[str, str]] = []
+        self.homes: list[str] = []
+        self.refuse = set(refuse)
 
-    def test_preserves_unrelated_lines_and_comments(self):
-        with _TmpHome() as home:
-            env_path = home / ".env"
-            env_path.write_text(
-                "# a comment\nOTHER_TOOL=keepme\nCOGNEE_API_KEY=old\n", encoding="utf-8"
-            )
-            config_mod.write_env_vars(env_path, {"COGNEE_API_KEY": "new"})
-            content = env_path.read_text(encoding="utf-8")
-        self.assertIn("# a comment", content)
-        self.assertIn("OTHER_TOOL=keepme", content)
-        self.assertIn("COGNEE_API_KEY=new", content)
-        self.assertNotIn("COGNEE_API_KEY=old", content)
+    def save_env_value(self, key, value):
+        if key in self.refuse:
+            raise ValueError("denylisted")
+        self.saved.append((key, value))
 
-    def test_appends_keys_that_are_not_present(self):
-        with _TmpHome() as home:
-            env_path = home / ".env"
-            env_path.write_text("EXISTING=1\n", encoding="utf-8")
-            config_mod.write_env_vars(env_path, {"NEW_KEY": "2"})
-            lines = env_path.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines, ["EXISTING=1", "NEW_KEY=2"])
+    def modules(self):
+        cli = types.ModuleType("hermes_cli")
+        cli_config = types.ModuleType("hermes_cli.config")
+        cli_config.save_env_value = self.save_env_value
+        constants = types.ModuleType("hermes_constants")
+        constants.set_hermes_home_override = lambda home: self.homes.append(home) or "token"
+        constants.reset_hermes_home_override = lambda token: self.homes.append(f"reset:{token}")
+        return {"hermes_cli": cli, "hermes_cli.config": cli_config, "hermes_constants": constants}
 
-    def test_empty_value_clears_a_key(self):
-        # This is how post_setup retires the deprecated COGNEE_SERVICE_URL alias.
-        with _TmpHome() as home:
-            env_path = home / ".env"
-            env_path.write_text("COGNEE_SERVICE_URL=https://legacy\n", encoding="utf-8")
-            config_mod.write_env_vars(env_path, {"COGNEE_SERVICE_URL": ""})
-            lines = env_path.read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines, ["COGNEE_SERVICE_URL="])
 
-    def test_no_values_writes_no_file(self):
-        with _TmpHome() as home:
-            env_path = home / ".env"
-            config_mod.write_env_vars(env_path, {})
-            self.assertFalse(env_path.exists())
+class TestSaveEnvVars(unittest.TestCase):
+    def test_values_go_through_hermes_writer_under_the_profile_home(self):
+        fake = _FakeHermesConfig()
+        with mock.patch.dict(sys.modules, fake.modules()):
+            config_mod.save_env_vars({"COGNEE_API_KEY": "secret", "COGNEE_SERVICE_URL": ""}, "/h")
+        self.assertEqual(fake.saved, [("COGNEE_API_KEY", "secret"), ("COGNEE_SERVICE_URL", "")])
+        self.assertEqual(fake.homes, ["/h", "reset:token"])
+
+    def test_a_refused_name_is_skipped_not_fatal(self):
+        fake = _FakeHermesConfig(refuse={"BAD"})
+        with mock.patch.dict(sys.modules, fake.modules()):
+            config_mod.save_env_vars({"BAD": "x", "LLM_API_KEY": "k"}, "/h")
+        self.assertEqual(fake.saved, [("LLM_API_KEY", "k")])
+
+    def test_no_values_touches_nothing(self):
+        fake = _FakeHermesConfig()
+        with mock.patch.dict(sys.modules, fake.modules()):
+            config_mod.save_env_vars({}, "/h")
+        self.assertEqual((fake.saved, fake.homes), ([], []))
+
+    def test_the_plugin_never_opens_a_dotenv_itself(self):
+        source = Path(config_mod.__file__).read_text(encoding="utf-8")
+        self.assertNotIn('".env"', source)
+
+
+class TestSecret(unittest.TestCase):
+    def test_reads_through_hermes_get_secret_when_available(self):
+        calls = []
+
+        def get_secret(name):
+            calls.append(name)
+            return " from-scope "
+
+        with mock.patch.object(config_mod, "_hermes_get_secret", get_secret):
+            self.assertEqual(config_mod.secret("COGNEE_API_KEY"), "from-scope")
+        self.assertEqual(calls, ["COGNEE_API_KEY"])
+
+    def test_falls_back_to_the_environment_without_hermes(self):
+        with (
+            mock.patch.object(config_mod, "_hermes_get_secret", None),
+            mock.patch.dict(os.environ, {"LLM_API_KEY": "env-key"}),
+        ):
+            self.assertEqual(config_mod.secret("LLM_API_KEY"), "env-key")
+
+    def test_load_config_takes_credentials_from_get_secret(self):
+        scope = {"COGNEE_API_KEY": "ck", "LLM_API_KEY": "sk", "COGNEE_BASE_URL": "https://c"}
+        with (
+            _TmpHome() as home,
+            mock.patch.object(config_mod, "_hermes_get_secret", scope.get),
+        ):
+            config = config_mod.load_config(home)
+        self.assertEqual(
+            (config["api_key"], config["llm_api_key"], config["service_url"]),
+            ("ck", "sk", "https://c"),
+        )
 
 
 class TestSaveConfig(unittest.TestCase):

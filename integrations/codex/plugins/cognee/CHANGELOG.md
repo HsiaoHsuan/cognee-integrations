@@ -10,7 +10,7 @@ is the cache key and semver record, bumped on each release, not the update trigg
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.7.6]
 
 ### Added
 - **Answers can credit Cognee memory (off by default on Codex).** With
@@ -31,6 +31,19 @@ project adheres to [Semantic Versioning](https://semver.org/).
   until COG-6828 (SDK-1071).
 
 ### Changed
+- **Bundled cognee is 1.6.5** (was 1.6.3; `_PINNED_COGNEE_VERSION`). The shared
+  `~/.cognee-plugin/venv` is upgraded on the next cold boot, which runs that release's
+  one new migration: additive columns that count embedding tokens apart from LLM tokens.
+  1.6.5 lets typed QA and trace entries carry a `node_set`, so `COGNEE_PROJECT_NODE_SET`
+  now works against the bundled server: captures are tagged with the project and keep
+  the tag through improve. On 1.6.3 the plugin's capability check failed and every
+  capture of the session stayed queued
+  ([#442](https://github.com/topoteretes/cognee-integrations/issues/442)); a session
+  that already recorded that error keeps it, and the next session recovers. 1.6.5 also
+  refuses a typed entry that names a different dataset than the one its session is bound
+  to. The `postgres-binary`, `neo4j`, `fastembed` and `ollama` extras the plugin probes
+  for are unchanged. The Claude Code, Antigravity and OpenClaw plugins, which share the
+  venv, move to 1.6.5 at the same time, so they never reinstall over each other.
 - **An empty recall no longer injects a memory header.** The "0 hits" line went into the
   agent's context on most turns; it is still shown to the user, and the recall audit log
   now records it in a `header` field.

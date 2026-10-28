@@ -71,6 +71,36 @@ class TestPreCompress(unittest.TestCase):
         self.assertIn("Cognee pre-compress improve failed: down", "\n".join(logs.output))
         self.assertEqual(provider._consecutive_failures, 1)
 
+    def test_an_exhausted_llm_budget_is_not_a_breaker_failure(self):
+        from cognee_integration_hermes.http_backend import CogneeHttpError
+
+        with fake_backend() as fake:
+            fake.errors["improve"] = CogneeHttpError(402, "budget")
+            provider = make_provider()
+            with self.assertLogs(provider_mod.logger, level="WARNING") as logs:
+                provider.on_pre_compress(_MESSAGES)
+                _settle(provider)
+        self.assertIn("LLM budget is exhausted (402)", "\n".join(logs.output))
+        self.assertEqual(provider._consecutive_failures, 0)
+
+    def test_buffered_turns_are_replayed_before_the_improve(self):
+        with fake_backend() as fake:
+            provider = make_provider(session_cognee_id="hermes_sP")
+            order = []
+            provider._drain_write_buffer = lambda budget, session_id="": order.append(
+                ("drain", session_id)
+            )
+            original = fake.improve
+
+            def improve(**kwargs):
+                order.append(("improve", kwargs["session_ids"][0]))
+                return original(**kwargs)
+
+            fake.improve = improve
+            provider.on_pre_compress(_MESSAGES)
+            _settle(provider)
+        self.assertEqual(order, [("drain", "hermes_sP"), ("improve", "hermes_sP")])
+
     def test_an_unexpected_error_never_reaches_hermes(self):
         with fake_backend():
             provider = make_provider()
@@ -126,6 +156,52 @@ class TestPreCompress(unittest.TestCase):
             provider._is_breaker_open = lambda: True
             provider.on_pre_compress(_MESSAGES)
             self.assert_no_improve(fake)
+
+
+class TestNothingNewIsNotImproved(unittest.TestCase):
+    """An improve with nothing stored since the last one is skipped (claude-code's
+    rule): the server's persist watermark makes improve incremental, but every
+    call still costs, so a session that compacted and then ended pays once."""
+
+    def test_pre_compress_skips_when_nothing_was_stored(self):
+        with fake_backend() as fake:
+            provider = make_provider(stored_since_improve=0)
+            provider.on_pre_compress(_MESSAGES)
+            _settle(provider)
+            self.assertEqual(fake.kwargs_for("improve"), [])
+
+    def test_compacted_then_ended_improves_once(self):
+        with fake_backend() as fake:
+            provider = make_provider(stored_since_improve=3)
+            provider.on_pre_compress(_MESSAGES)
+            _settle(provider)
+            provider.on_session_end(_MESSAGES)
+            self.assertEqual(len(fake.kwargs_for("improve")), 1)
+
+    def test_writes_after_a_compaction_are_improved_at_session_end(self):
+        with fake_backend() as fake:
+            provider = make_provider(stored_since_improve=3)
+            provider.on_pre_compress(_MESSAGES)
+            _settle(provider)
+            provider.sync_turn("later", "answer")
+            provider._sync_thread.join(timeout=5.0)
+            provider.on_session_end(_MESSAGES)
+            self.assertEqual(len(fake.kwargs_for("improve")), 2)
+
+    def test_a_handed_off_close_with_nothing_new_only_unregisters(self):
+        with fake_backend():
+            provider = make_provider(stored_since_improve=0, watcher_state_path=Path("/tmp/w.json"))
+            with mock.patch.object(
+                provider_mod.exit_watcher, "finalize", return_value=True
+            ) as finalize:
+                provider.on_session_end(_MESSAGES)
+            self.assertIs(finalize.call_args.kwargs["improve"], False)
+
+    def test_a_new_session_starts_with_nothing_stored(self):
+        with fake_backend():
+            provider = make_provider(stored_since_improve=5)
+            provider.on_session_switch("s-2", reset=True)
+            self.assertEqual(provider._stored_since_improve, 0)
 
 
 if __name__ == "__main__":
