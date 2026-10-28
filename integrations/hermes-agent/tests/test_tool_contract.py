@@ -342,7 +342,7 @@ class TestDispatch(unittest.TestCase):
                 self.assertIn("temporarily unavailable", out["error"])
         self.assertEqual(fake.calls, [])
 
-    def test_tool_schemas_are_the_five_declared_tools_with_required_params(self):
+    def test_tool_schemas_are_the_six_declared_tools_with_required_params(self):
         provider = make_provider()
         schemas = {schema["name"]: schema for schema in provider.get_tool_schemas()}
         self.assertEqual(
@@ -353,6 +353,7 @@ class TestDispatch(unittest.TestCase):
                 "cognee_forget",
                 "cognee_switch_dataset",
                 "cognee_code_search",
+                "cognee_recap",
             },
         )
         self.assertEqual(schemas["cognee_recall"]["parameters"]["required"], ["query"])
@@ -360,13 +361,16 @@ class TestDispatch(unittest.TestCase):
         self.assertEqual(schemas["cognee_forget"]["parameters"]["required"], ["action"])
         self.assertEqual(schemas["cognee_switch_dataset"]["parameters"]["required"], ["action"])
         self.assertEqual(schemas["cognee_code_search"]["parameters"]["required"], ["operation"])
+        self.assertEqual(schemas["cognee_recap"]["parameters"]["required"], ["kind"])
         self.assertEqual(
             set(schemas["cognee_recall"]["parameters"]["properties"]),
             {"query", "search_type", "top_k"},
         )
 
     def test_optional_tools_can_be_disabled_by_config(self):
-        provider = make_provider(config={"dataset_switch_tool": False, "code_search_tool": False})
+        provider = make_provider(
+            config={"dataset_switch_tool": False, "code_search_tool": False, "recap_tool": False}
+        )
         names = {schema["name"] for schema in provider.get_tool_schemas()}
         self.assertEqual(names, {"cognee_recall", "cognee_remember", "cognee_forget"})
 
@@ -451,11 +455,12 @@ class TestRecallPayload(unittest.TestCase):
         self.assertEqual(kwargs["top_k"], 7)
         self.assertIs(kwargs["auto_route"], False)
 
-    def test_recall_targets_the_graph_with_the_dataset_and_the_session(self):
+    def test_recall_targets_the_graph_with_the_dataset_and_no_session(self):
         kwargs = self._recall_kwargs({"query": "q"}, session_cognee_id="hermes_abc")
         self.assertEqual(kwargs["scope"], ["graph"])
         self.assertEqual(kwargs["datasets"], ["hermes"])
-        self.assertEqual(kwargs["session_id"], "hermes_abc")
+        # As openclaw's memory_search: the conversation is already Hermes'.
+        self.assertIsNone(kwargs["session_id"])
 
     def test_a_legacy_scope_argument_is_ignored(self):
         # The tool no longer takes ``scope``; an older caller passing one gets
@@ -465,7 +470,7 @@ class TestRecallPayload(unittest.TestCase):
                 kwargs = self._recall_kwargs({"query": "q", "scope": legacy})
                 self.assertEqual(kwargs["scope"], ["graph"])
                 self.assertEqual(kwargs["datasets"], ["hermes"])
-                self.assertIsNotNone(kwargs["session_id"])
+                self.assertIsNone(kwargs["session_id"])
 
     def test_search_type_is_applied(self):
         kwargs = self._recall_kwargs({"query": "q", "search_type": "CHUNKS"})

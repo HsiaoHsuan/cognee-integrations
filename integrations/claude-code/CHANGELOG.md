@@ -10,6 +10,57 @@ Code only offers an update when that string changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.4-fork.1]
+
+### Changed
+- Merged upstream 1.7.4 into the fork. The fork changes from 1.6.6-fork.1
+  through 1.6.6-fork.6 are kept on top of it.
+
+## [1.7.4]
+
+### Removed
+- **The tokens-saved estimate is gone from the status line and the row above the
+  prompt.** It was not a measurement, so the row no longer shows it. The row keeps the
+  connection glyph, dataset, mode, credits and what memory is doing.
+
+### Changed
+- **Clearer first-run tour.** The arrow now sits right after the dataset name it points
+  to, and the last hint says typing `/cognee` shows the plugin's commands.
+
+## [1.7.3]
+
+### Changed
+- **Bundled cognee is 1.6.5** (was 1.6.3; `_PINNED_COGNEE_VERSION`). The shared
+  `~/.cognee-plugin/venv` is upgraded on the next cold boot, which runs that release's
+  one new migration: additive columns that count embedding tokens apart from LLM tokens.
+  1.6.5 lets typed QA and trace entries carry a `node_set`, so `COGNEE_PROJECT_NODE_SET`
+  now works against the bundled server: captures are tagged with the project and keep
+  the tag through improve. On 1.6.3 the plugin's capability check failed and every
+  capture of the session stayed queued
+  ([#442](https://github.com/topoteretes/cognee-integrations/issues/442)); a session
+  that already recorded that error keeps it, and the next session recovers. 1.6.5 also
+  refuses a typed entry that names a different dataset than the one its session is bound
+  to. The `postgres-binary`, `neo4j`, `fastembed` and `ollama` extras the plugin probes
+  for are unchanged. The Codex, Antigravity and OpenClaw plugins, which share the venv,
+  move to 1.6.5 at the same time, so they never reinstall over each other.
+
+## [1.7.2]
+
+### Added
+- **The Cognee logotype on the credit line in a terminal.** The line the model writes
+  under an answer that used memory (`> 🧠 Cognee memory [m4, m5]: …`) is drawn in a
+  terminal as the display logotype from the brand resources and the note alone, as
+  the Desktop app already draws it with the wave mark. The logotype is built from
+  squares on a grid, so each square is one braille dot: 11 columns by 2 rows, the
+  letters in the logotype's own proportions, bold in the darker brand purple so the
+  thin dots read on light and dark backgrounds, centred beside a note that runs
+  longer. The stored message is unchanged (ctrl+o, the Stop hook's credit check),
+  and the `icon` row in `/config` turns the logotype off with the wave.
+
+### Changed
+- **The credit note opens with a capital letter.** The model writes the note as the
+  end of the `Cognee memory [mN]:` sentence; drawn without that label, on the desktop
+  and in a terminal, its first letter is now capitalised.
 ## [1.7.1-fork.1]
 
 ### Changed
@@ -48,9 +99,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
   a terminal alike, with a braille spinner while an operation runs. In a terminal
   the module marks its session (`~/.cognee-plugin/claude-code/band/<session>.json`)
   and the renderer, run as a settings-file status line, prints nothing for a
-  marked session, so the row is not shown twice. The row carries the wordmark, the
-  counters and the tokens-saved estimate the text line shows (below), the
-  dataset as a picker, and what memory is doing; the credit inside an answer that
+  marked session, so the row is not shown twice. The row carries the wordmark and
+  the counters the text line shows (below), the dataset as a picker, and what memory is doing; the credit inside an answer that
   used memory stays the agent's own (below). It also adds what memory is doing
   after the spinner while Claude works (on the desktop for every phase; in a
   terminal only for the async phases, whose hooks show no status message of
@@ -176,13 +226,10 @@ project adheres to [Semantic Versioning](https://semver.org/).
   a dim `○` while unknown, and on a failure the red `✕ (<reason>)` leads the line
   (the row above the prompt opens with the brain and `cognee` in the brand
   lavender). No counters: the activity segment (`3 memories used`) says what
-  the latest prompt got and the tokens-saved estimate what memory spared; a
-  session total, a per-prompt hit count and a turn ratio are not shown. The
+  the latest prompt got; a session total, a per-prompt hit count and a turn ratio are not shown. The
   classic line keeps its own counters.
-- **Estimated tokens saved.** The line shows an estimate computed as injected context
-  tokens (four characters per token) × 6.9; it is a heuristic, not measured billing,
-  and shows `n/a` when unmeasured. Recall also records how much context session
-  deduplication kept out (`dedup_chars_saved`).
+- Recall records how much context session deduplication kept out
+  (`dedup_chars_saved`).
 - **Cognee searches are named in progress text.** The search, code and architecture
   skills and the session-start guidance ask the agent to say "Searching Cognee…"
   before an explicit search, and to credit recalled memory only when it was used.

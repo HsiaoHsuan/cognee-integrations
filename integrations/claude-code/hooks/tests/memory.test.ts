@@ -16,10 +16,6 @@ const SNAPSHOT = {
   credits: '',
   update: '',
   text: 'cognee: agent_sessions · local',
-  counts: {
-    tokens_saved: 'tokens saved n/a',
-    tokens_saved_short: 'saved n/a',
-  },
 }
 
 const SWITCH_LIST = {
@@ -521,7 +517,7 @@ test('the first session on a machine gets the tour under the row, once', async (
   await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
 
   const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...BAND })
-  expect(await ui.find({ type: 'Text', text: /The dataset name is a picker ↑/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /The dataset name ↑ is a picker/ })).toBeDefined()
   expect(await ui.find({ type: 'Button', key: 'tourNext' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^cognee / })).toBeDefined()
 
@@ -574,7 +570,7 @@ test('/cognee-tour replays it, and the tour row in /config turns it off', async 
   const answer = await $.command.run({ command: 'cognee-tour', args: '' })
   expect(answer.text).toContain('tour')
   const ui = await $.ui.mount({ plugin: PLUGIN, surface: 'terminal', ...BAND })
-  expect(await ui.find({ type: 'Text', text: /The dataset name is a picker ↑/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /The dataset name ↑ is a picker/ })).toBeDefined()
   await ui.unmount()
 })
 
@@ -809,11 +805,6 @@ test('credits read green on the row, red once exhausted, the last cost plain', a
   expect(balance!.props.color).toBe('green')
   const last = await ui.find({ type: 'Text', text: /last improve ~\$0.03/ })
   expect(last!.props.color).toBeUndefined()
-  // The estimate keeps the brand colour and weight even when unmeasured.
-  const estimate = await ui.find({ type: 'Text', text: /tokens saved n\/a/ })
-  expect(estimate!.props.color).toBe('#bc9bff')
-  expect(estimate!.props.bold).toBe(true)
-  expect(estimate!.props.dimColor).toBeUndefined()
   await ui.unmount()
 
   exhausted = true

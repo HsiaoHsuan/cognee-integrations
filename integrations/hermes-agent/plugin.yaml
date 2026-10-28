@@ -9,7 +9,7 @@ pip_dependencies:
   # targeted session invalidation on document delete first shipped in 1.5.3 —
   # and 1.6.0 is what the plugin is written against: the password-less default
   # user and the only_context prompt contract.
-  - cognee==1.6.1
+  - cognee==1.6.5
 hooks:
   - on_session_end
   - on_pre_compress

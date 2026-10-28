@@ -227,6 +227,7 @@ class FakeBackend(MemoryBackend):
         self._recorder.results = {
             "recall": [],
             "remember_session": None,
+            "remember_entry": None,
             "remember_permanent": RememberResultStub(),
             "forget": {"deleted": True},
             "forget_document": {"deleted": True},
@@ -235,6 +236,8 @@ class FakeBackend(MemoryBackend):
             "resolve_identity": "USER",
             "list_datasets": [],
             "list_dataset_data": [],
+            "list_sessions": {"sessions": [], "has_more": False},
+            "get_session": None,
             "read_raw_data": "",
             "index_repository": {},
             "dataset_pipeline_status": "",
@@ -293,10 +296,22 @@ class FakeBackend(MemoryBackend):
         self._recorder.record("close", kwargs)
 
     def recall(self, **kwargs):
-        return self._recorder.record("recall", kwargs)
+        result = self._recorder.record("recall", kwargs)
+        # The guidance lane (``scope=["session_context"]``) answers from its own
+        # slot, so a test's ``results["recall"]`` stays the graph's answer.
+        # ``errors["recall:session_context"]`` makes only that lane fail.
+        if list(kwargs.get("scope") or []) == ["session_context"]:
+            error = self._recorder.errors.get("recall:session_context")
+            if error is not None:
+                raise error
+            return self._recorder.results.get("recall:session_context", [])
+        return result
 
     def remember_session(self, **kwargs):
         return self._recorder.record("remember_session", kwargs)
+
+    def remember_entry(self, **kwargs):
+        return self._recorder.record("remember_entry", kwargs)
 
     def remember_permanent(self, **kwargs):
         return self._recorder.record("remember_permanent", kwargs)
@@ -309,6 +324,12 @@ class FakeBackend(MemoryBackend):
 
     def list_datasets(self, **kwargs):
         return self._recorder.record("list_datasets", kwargs)
+
+    def list_sessions(self, **kwargs):
+        return self._recorder.record("list_sessions", kwargs)
+
+    def get_session(self, **kwargs):
+        return self._recorder.record("get_session", kwargs)
 
     def list_dataset_data(self, **kwargs):
         return self._recorder.record("list_dataset_data", kwargs)
@@ -368,6 +389,7 @@ def make_provider(
     writes_enabled=True,
     auto_route=True,
     improve_on_end=True,
+    stored_since_improve=1,
     config=None,
 ):
     """A provider with post-``initialize()`` state set and a fake transport.
@@ -391,6 +413,10 @@ def make_provider(
     provider._session_id = session_id
     provider._session_cognee_id = session_cognee_id or f"hermes_{session_id}"
     provider._default_dataset = dataset
+    # Entries stored since the session's last improve. A session that stored
+    # nothing skips its pre-compress and session-end improves, so the default is
+    # a session that has written something; pass 0 to test the skip.
+    provider._stored_since_improve = stored_since_improve
     provider._config = {
         "recall_timeout": 5,
         "write_timeout": 5,

@@ -38,6 +38,30 @@ DEFAULT_IDENTITY_PASSWORD = "hermes-agent-plugin"
 # transport.
 DEFAULT_USER_EMAIL = "default_user@example.com"
 DEFAULT_USER_PASSWORD = "default_password"
+# Recall trimming defaults, the shared reference values (recall_text.py).
+DEFAULT_RECALL_PASSAGE_CHARS = 2000
+DEFAULT_RECALL_CONTEXT_CHARS = 12000
+
+
+try:
+    from agent.secret_scope import get_secret as _hermes_get_secret
+except ImportError:  # older Hermes, or the package imported outside Hermes
+    _hermes_get_secret = None
+
+
+def secret(name: str) -> str:
+    """A credential the way Hermes hands it out, ``""`` when unset.
+
+    Hermes's ``get_secret`` honours the active profile, which a bare
+    ``os.environ`` read does not when one gateway serves several profiles (and
+    the plugin-catalog rules require it). Without that API, read the environment,
+    which is where Hermes put the profile's ``.env`` before the API existed.
+    """
+    if _hermes_get_secret is not None:
+        value = _hermes_get_secret(name)
+    else:
+        value = os.environ.get(name)
+    return str(value or "").strip()
 
 
 def str_to_bool(value: Any, default: bool = False) -> bool:
@@ -193,12 +217,12 @@ def load_config(hermes_home: str | Path | None = None) -> dict[str, Any]:
     """Load plugin config from environment variables and HERMES_HOME/cognee.json."""
     # COGNEE_BASE_URL is the canonical name; COGNEE_SERVICE_URL is a deprecated alias
     # kept for backward compatibility. A set service_url selects remote/cloud mode.
-    service_url = os.environ.get("COGNEE_BASE_URL") or os.environ.get("COGNEE_SERVICE_URL", "")
+    service_url = secret("COGNEE_BASE_URL") or secret("COGNEE_SERVICE_URL")
     config: dict[str, Any] = {
-        "llm_api_key": os.environ.get("LLM_API_KEY", ""),
+        "llm_api_key": secret("LLM_API_KEY"),
         "llm_model": os.environ.get("LLM_MODEL", ""),
         "service_url": service_url,
-        "api_key": os.environ.get("COGNEE_API_KEY", ""),
+        "api_key": secret("COGNEE_API_KEY"),
         # Connection mode knobs (see provider.initialize / README "Modes").
         # embedded=true runs cognee in-process (single-process/offline only);
         # otherwise local mode ensures a local server on local_port (DB-safe).
@@ -236,6 +260,17 @@ def load_config(hermes_home: str | Path | None = None) -> dict[str, Any]:
         # holds the session history, retrieved context and guidance), plus the
         # code lane when armed. The budget bounds the whole prefetch.
         "recall_budget": str_to_int(os.environ.get("COGNEE_RECALL_BUDGET"), 20),
+        # Recall trimming (SDK-904): each recalled passage is capped at
+        # recall_passage_chars, and recall_context_chars bounds the whole
+        # injection. 0 disables either. Same defaults and variables as openclaw.
+        "recall_passage_chars": str_to_int(
+            os.environ.get("COGNEE_RECALL_PASSAGE_CHARS"), DEFAULT_RECALL_PASSAGE_CHARS
+        ),
+        "recall_context_chars": str_to_int(
+            os.environ.get("COGNEE_RECALL_CONTEXT_CHARS"), DEFAULT_RECALL_CONTEXT_CHARS
+        ),
+        # Tokens per chunk for permanent writes (#428); 0 leaves it to the server.
+        "chunk_size": str_to_int(os.environ.get("COGNEE_CHUNK_SIZE"), 0),
         # Memory steer: one system-prompt line asserting Cognee as the preferred,
         # authoritative long-term memory (the COGNEE_PREFER_MEMORY counterpart).
         "memory_steer": str_to_bool(os.environ.get("COGNEE_MEMORY_STEER"), True),
@@ -245,6 +280,7 @@ def load_config(hermes_home: str | Path | None = None) -> dict[str, Any]:
         # Agent tools beyond the recall/remember/forget trio.
         "dataset_switch_tool": str_to_bool(os.environ.get("COGNEE_DATASET_SWITCH_TOOL"), True),
         "code_search_tool": str_to_bool(os.environ.get("COGNEE_CODE_SEARCH_TOOL"), True),
+        "recap_tool": str_to_bool(os.environ.get("COGNEE_RECAP_TOOL"), True),
         # The identifier-gated code recall lane, plus extra always-on code
         # datasets (comma-separated) for repos indexed from another machine.
         "code_graph_recall": str_to_bool(os.environ.get("COGNEE_CODE_GRAPH_RECALL"), True),
@@ -279,10 +315,18 @@ def load_config(hermes_home: str | Path | None = None) -> dict[str, Any]:
     config["improve_on_end"] = str_to_bool(config.get("improve_on_end"), True)
     config["embedded"] = str_to_bool(config.get("embedded"), False)
     config["recall_budget"] = max(1, str_to_int(config.get("recall_budget"), 20))
+    for key, default in (
+        ("recall_passage_chars", DEFAULT_RECALL_PASSAGE_CHARS),
+        ("recall_context_chars", DEFAULT_RECALL_CONTEXT_CHARS),
+    ):
+        value = str_to_int(config.get(key), default)
+        config[key] = value if value >= 0 else default
+    config["chunk_size"] = max(0, str_to_int(config.get("chunk_size"), 0))
     config["memory_steer"] = str_to_bool(config.get("memory_steer"), True)
     config["memory_hits"] = str_to_bool(config.get("memory_hits"), True)
     config["dataset_switch_tool"] = str_to_bool(config.get("dataset_switch_tool"), True)
     config["code_search_tool"] = str_to_bool(config.get("code_search_tool"), True)
+    config["recap_tool"] = str_to_bool(config.get("recap_tool"), True)
     config["code_graph_recall"] = str_to_bool(config.get("code_graph_recall"), True)
     config["update_check"] = str_to_bool(config.get("update_check"), True)
     config["update_check_interval"] = max(60, str_to_int(config.get("update_check_interval"), 3600))
@@ -310,30 +354,32 @@ def save_config(values: dict[str, Any], hermes_home: str | Path) -> Path:
     return path
 
 
-def write_env_vars(env_path: Path, values: dict[str, str]) -> None:
-    """Append or update environment variables in a Hermes .env file."""
+def save_env_vars(values: dict[str, str], hermes_home: str | Path | None = None) -> None:
+    """Store setup's values in the profile's ``.env`` through Hermes's own writer.
+
+    The plugin never opens a ``.env`` itself (plugin-catalog rule 11): Hermes's
+    ``save_env_value`` validates the name, strips CR/LF and writes 0600
+    atomically. A non-default profile's home is applied through Hermes's
+    context-local override, the way Hermes's own memory setup does it. An empty
+    value clears a key (how the deprecated ``COGNEE_SERVICE_URL`` is retired).
+    """
     if not values:
         return
+    from hermes_cli.config import save_env_value
 
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    existing_lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
-
-    updated: set[str] = set()
-    new_lines: list[str] = []
-    for line in existing_lines:
-        key = line.split("=", 1)[0].strip() if "=" in line else ""
-        if key in values:
-            new_lines.append(f"{key}={values[key]}")
-            updated.add(key)
-        else:
-            new_lines.append(line)
-
-    for key, value in values.items():
-        if key not in updated:
-            new_lines.append(f"{key}={value}")
-
-    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
     try:
-        env_path.chmod(0o600)
-    except OSError:
-        pass
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    except ImportError:  # older Hermes: save_env_value writes the active home
+        set_hermes_home_override = reset_hermes_home_override = None
+    token = None
+    if hermes_home is not None and set_hermes_home_override is not None:
+        token = set_hermes_home_override(str(hermes_home))
+    try:
+        for key, value in values.items():
+            try:
+                save_env_value(key, value)
+            except ValueError as exc:  # a name Hermes refuses to write
+                print(f"  Skipping {key}: {exc}")
+    finally:
+        if token is not None:
+            reset_hermes_home_override(token)

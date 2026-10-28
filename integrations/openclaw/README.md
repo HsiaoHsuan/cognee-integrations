@@ -66,7 +66,7 @@ turns turn capture off; `autoIndex: false` stops the file sync.
 Memory is kept until you delete it (`memory_forget`, `openclaw cognee forget`, or
 deleting the dataset). The plugin never expires server-side memory on its own.
 
-**Other network calls.** Local mode installs the pinned `cognee==1.6.3` from PyPI into
+**Other network calls.** Local mode installs the pinned `cognee==1.6.5` from PyPI into
 `~/.cognee-plugin/venv` once (no interpreter or installer is ever downloaded). On
 gateway start the plugin checks `registry.npmjs.org` for a newer release of this
 package, at most once a day (`COGNEE_UPDATE_CHECK=false` turns it off). No telemetry, no analytics: nothing is sent to Cognee or
@@ -584,7 +584,7 @@ Summarizes the sessions Cognee recorded, the OpenClaw counterpart of the Claude 
 
 `since` takes `24h`, `7d`, `2w`, `today`, `yesterday`, `week`, `month`, `all` or a date; `projects` keeps only some agents or repositories. A recap only covers sessions recorded into the calling agent's own datasets (its capture dataset and recall scopes), so on a shared gateway one agent never sees another agent's or user's conversations; `allSessions` additionally includes sessions other clients (e.g. Claude Code) recorded into those same datasets, and never widens the datasets. The output is a deterministic Markdown skeleton framed as recorded data, which the model summarizes; it is never treated as instructions. Sessions are grouped by agent. `openclaw cognee standup|digest|timeline` prints the same thing. Set `recapTool: false` to not register it.
 
-The plugin's bundled server pin is `cognee==1.6.3` (`src/server.ts`; the venv is upgraded automatically on next boot) and `cognee-docker-compose.yaml` uses `cognee/cognee:1.6.3`. The claude-code/codex/antigravity plugins share the same `~/.cognee-plugin/venv`.
+The plugin's bundled server pin is `cognee==1.6.5` (`src/server.ts`; the venv is upgraded automatically on next boot) and `cognee-docker-compose.yaml` uses `cognee/cognee:1.6.5`. The claude-code/codex/antigravity plugins share the same `~/.cognee-plugin/venv`.
 
 ### Memory-hit visibility
 

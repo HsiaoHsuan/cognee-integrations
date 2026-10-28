@@ -353,6 +353,8 @@ def _make_provider():
     """A provider on a fake transport, plus a recorder of what it was asked to do."""
     backend = FakeBackend()
     p = provider_mod.CogneeMemoryProvider(backend=backend)
+    # A session that has stored something, so its close has something to improve.
+    p._stored_since_improve = 1
     return p, _Recorder(backend)
 
 
@@ -573,7 +575,7 @@ class TestTransportSelection(unittest.TestCase):
                 mock.patch.object(HttpBackend, "connect"),
             ):
                 provider.initialize("sid", hermes_home=home)
-            self.assertEqual(provider._backend._cache_dir, config_mod.SHARED_PLUGIN_STATE_DIR)
+            self.assertIsInstance(provider._backend, HttpBackend)
 
 
 class TestExitWatcherLifecycle(unittest.TestCase):

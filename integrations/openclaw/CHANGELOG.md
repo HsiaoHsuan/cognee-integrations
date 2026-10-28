@@ -11,6 +11,19 @@ reports an update only when the published npm version changes. Tag releases as
 The format is based on [Keep a Changelog](https://keepachangelog.com/). Versions are
 date-based (`YYYY.M.D`), matching the OpenClaw plugin ecosystem.
 
+## [2026.10.19]
+
+### Changed
+- **Bundled cognee is 1.6.5** (was 1.6.3; `COGNEE_VERSION` in `src/server.ts`, and
+  `cognee-docker-compose.yaml` runs `cognee/cognee:1.6.5`). The shared
+  `~/.cognee-plugin/venv` is upgraded on the next cold boot, which runs that
+  release's one new migration: additive columns that count embedding tokens apart
+  from LLM tokens. The Claude Code, Codex and Antigravity plugins, which share the
+  venv and database, move to 1.6.5 at the same time: a 1.6.3 server refuses to start
+  on a database a 1.6.5 server already migrated. 1.6.5 lets typed session entries
+  carry a `node_set` and refuses a typed entry that names a different dataset than
+  the one its session is bound to.
+
 ## [2026.10.13]
 
 Brings the plugin to cognee 1.6.3 and to parity with the Claude Code and Codex

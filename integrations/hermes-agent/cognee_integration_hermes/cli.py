@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 import time
 from pathlib import Path
 
-from . import catalog, code_graph, update_check
+from . import catalog, code_graph, recap, update_check
 from .config import DEFAULT_LOCAL_PORT, config_path, load_config, resolve_local_roots
 
 
@@ -196,6 +197,48 @@ def _run_index_repo(args) -> int:
             pass
 
 
+def _run_recap(args) -> int:
+    """``hermes cognee standup|digest|timeline``: the recap skeleton for this dataset."""
+    from .provider import _safe_dataset_name
+
+    cfg = load_config()
+    dataset = _safe_dataset_name(str(getattr(args, "dataset", "") or cfg.get("dataset") or ""))
+    try:
+        backend = _connect_backend()
+    except Exception as exc:
+        print(f"Error: could not reach a cognee server: {exc}", file=sys.stderr)
+        return 1
+    try:
+        result = recap.run_recap(
+            recap.BackendRecapApi(backend),
+            kind=args.cognee_command,
+            dataset_ids=recap.resolve_dataset_ids(backend, [dataset]),
+            datasets=[dataset],
+            topic=str(getattr(args, "topic", "") or ""),
+            since=str(args.since or ""),
+            projects=[p.strip() for p in (args.projects or "").split(",") if p.strip()],
+            all_sessions=bool(args.all_sessions),
+            max_sessions=int(args.max_sessions),
+            max_learnings=int(args.max_learnings),
+            session_prefixes=(f"{cfg.get('session_prefix') or 'hermes'}_",),
+        )
+    except Exception as exc:
+        print(f"Error: no recap: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            backend.close(timeout=5)
+        except Exception:
+            pass
+    for warning in result["warnings"]:
+        print(f"[cognee recap] {warning}", file=sys.stderr)
+    if args.json:
+        print(json.dumps(result["json"], indent=2, default=str))
+    else:
+        print(result["markdown"])
+    return 0
+
+
 def _poll_code_graph(backend, dataset_id: str, deadline_seconds: float) -> str:
     """Poll the code_graph_pipeline until completed/errored/timeout."""
     deadline = time.monotonic() + max(0.0, deadline_seconds)
@@ -267,6 +310,8 @@ def cognee_command(args) -> None:
         _print_version(args)
     elif sub == "index-repo":
         raise SystemExit(_run_index_repo(args))
+    elif sub in recap.RECAP_KINDS:
+        raise SystemExit(_run_recap(args))
     else:
         _print_status(args)
 
@@ -309,4 +354,33 @@ def register_cli(subparser) -> None:
         metavar="SECONDS",
         help="Wait up to SECONDS for the indexing pipeline to finish",
     )
+    recap_help = {
+        "standup": "What was worked on and left open (default: last 24h)",
+        "digest": "Sessions plus the lessons distilled into memory (default: last 7d)",
+        "timeline": "A dated chronology of one topic (default: last 30d)",
+    }
+    for kind in recap.RECAP_KINDS:
+        cmd = subs.add_parser(kind, help=recap_help[kind])
+        if kind == "timeline":
+            cmd.add_argument("topic", help="The topic to trace")
+        cmd.add_argument(
+            "--since",
+            default="",
+            help="24h, 7d, 2w, today, yesterday, week, month, all, or a date",
+        )
+        cmd.add_argument("--json", action="store_true", help="Machine-readable output")
+        cmd.add_argument(
+            "--all-sessions",
+            action="store_true",
+            help="Also include other clients' sessions recorded into this dataset",
+        )
+        cmd.add_argument("--max-sessions", type=int, default=recap.DEFAULT_MAX_SESSIONS)
+        cmd.add_argument(
+            "--max-learnings",
+            type=int,
+            default=recap.DEFAULT_MAX_LEARNINGS,
+            help="Digest: newest graph learnings to fetch and list (0 = all)",
+        )
+        cmd.add_argument("--projects", default="", help="Comma-separated repository substrings")
+        cmd.add_argument("--dataset", default="", help="Dataset (default: the configured one)")
     subparser.set_defaults(func=cognee_command)

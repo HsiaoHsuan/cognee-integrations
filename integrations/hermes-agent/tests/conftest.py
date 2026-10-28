@@ -69,9 +69,9 @@ def hermetic_env(request, monkeypatch, tmp_path):
 
     The shared state files under ``~/.cognee-plugin/hermes/`` are re-pointed at
     the test's tmp dir for the same reason the env is scrubbed: the dataset
-    overrides a developer switched, the repos they indexed for code recall and
-    their cached update check would otherwise leak into (and be written by)
-    the hermetic suite.
+    overrides a developer switched, the repos they indexed for code recall,
+    their cached update check and their buffered capture writes would otherwise
+    leak into (and be written by) the hermetic suite.
     """
     if request.module.__name__.rsplit(".", 1)[-1] in _LIVE_MODULES:
         return
@@ -79,8 +79,27 @@ def hermetic_env(request, monkeypatch, tmp_path):
         if name.startswith(_SCRUBBED_PREFIXES):
             monkeypatch.delenv(name, raising=False)
 
-    from cognee_integration_hermes import code_graph, dataset_overrides, update_check
+    from cognee_integration_hermes import (
+        code_graph,
+        dataset_overrides,
+        update_check,
+        write_buffer,
+    )
 
     monkeypatch.setattr(code_graph, "_STATE_DIR", tmp_path / "code-graph")
     monkeypatch.setattr(dataset_overrides, "_OVERRIDES_PATH", tmp_path / "dataset-overrides.json")
     monkeypatch.setattr(update_check, "_CACHE_PATH", tmp_path / "update-check.json")
+    monkeypatch.setattr(write_buffer, "WRITE_BUFFER_PATH", tmp_path / "pending-entries.json")
+
+
+@pytest.fixture(autouse=True)
+def fresh_process_state(monkeypatch):
+    """Per-process state starts empty in every test, as in a new Hermes process.
+
+    The keys a local server handed out (http_backend._RESOLVED_KEYS) and the
+    one-time "no LLM key" warning would otherwise carry from one test to the next.
+    """
+    from cognee_integration_hermes import http_backend, server_bootstrap
+
+    monkeypatch.setattr(http_backend, "_RESOLVED_KEYS", {})
+    monkeypatch.setattr(server_bootstrap, "_warned_no_llm_key", False)

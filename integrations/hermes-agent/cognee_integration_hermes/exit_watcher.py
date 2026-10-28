@@ -26,8 +26,8 @@ spawn dies before claiming, the poller is still there to catch it.
 This module runs as a plain script (``python exit_watcher.py --state <path>
 [--final]``), outside the package, so nothing here may import from the package —
 everything it needs travels in the state file, plus the API key, which stays out
-of world-readable places: it is handed over via the child's environment and falls
-back to the shared ``~/.cognee-plugin/api_key.json`` cache.
+of world-readable places: the provider hands it over in the child's environment,
+and the watcher never reads a key from a file of its own accord.
 """
 
 import argparse
@@ -37,14 +37,11 @@ import os
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
-
-# Duplicated from config.SHARED_PLUGIN_STATE_DIR (this file must run without the
-# package): the key cache shared with the other cognee plugins.
-_SHARED_KEY_CACHE = Path.home() / ".cognee-plugin" / "api_key.json"
 
 _DEFAULT_POLL_SECONDS = 2.0
 _UNREGISTER_TIMEOUT = 15.0
@@ -165,6 +162,9 @@ def claim_once(state_path):
 def _spawn(state_path, extra_args, *, api_key, log_path):
     """Start this file as a detached process that outlives its parent."""
     env = dict(os.environ)
+    # Exactly the key the provider resolved, never one inherited from Hermes's
+    # environment (under a multi-profile gateway that may be another profile's).
+    env.pop("COGNEE_API_KEY", None)
     if api_key:
         env["COGNEE_API_KEY"] = str(api_key)
     log = subprocess.DEVNULL
@@ -213,8 +213,10 @@ def arm(
     """Write the watcher's state file and spawn the detached watcher process.
 
     The state file deliberately carries no API key — the key goes through the
-    child's environment instead, and the watcher can re-read the shared cache at
-    fire time (the key may not even exist yet when Hermes starts).
+    child's environment instead. The provider arms the watcher after connecting,
+    so it hands over the key the session resolved. That key is empty when the
+    session runs without one (a server with auth off, or a failed mint); the
+    watcher then logs that its calls may be rejected.
     """
     # State files are keyed on the Hermes pid, and pids recycle. A marker left by
     # whoever held this pid last would silently no-op this session's close.
@@ -314,22 +316,6 @@ def _log(message):
     print(time.strftime("[%Y-%m-%d %H:%M:%S] ") + message, flush=True)
 
 
-def _cached_api_key(url):
-    """The shared single-principal key, matching the other plugins' cache rules."""
-    try:
-        data = json.loads(_SHARED_KEY_CACHE.read_text(encoding="utf-8"))
-    except Exception:
-        return ""
-    if not isinstance(data, dict):
-        return ""
-    key = str(data.get("api_key") or "").strip()
-    cached_url = str(data.get("base_url") or "").strip().rstrip("/")
-    wanted = str(url or "").strip().rstrip("/")
-    if wanted and cached_url and cached_url != wanted:
-        return ""
-    return key
-
-
 def _post(url, path, payload, *, api_key, timeout):
     headers = {"Content-Type": "application/json"}
     if api_key:
@@ -368,7 +354,10 @@ def fire(state, *, state_path=None, wait_for_parent=0.0):
         _log("session already closed by another worker; exiting")
         return False
     url = str(state.get("url") or "")
-    api_key = os.environ.get("COGNEE_API_KEY", "").strip() or _cached_api_key(url)
+    # Only the key the provider put in this process's environment at spawn time.
+    api_key = os.environ.get("COGNEE_API_KEY", "").strip()
+    if not api_key:
+        _log("no API key was handed over; a server that requires one will reject this close")
     session_id = str(state.get("session_id") or "")
     if state.get("improve") and session_id:
         try:
@@ -384,6 +373,15 @@ def fire(state, *, state_path=None, wait_for_parent=0.0):
                 timeout=float(state.get("improve_timeout") or 300.0),
             )
             _log("improve submitted for session %s" % session_id)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 402:
+                # cognee >= 1.6.3: the server's LLM budget is exhausted.
+                _log(
+                    "improve skipped for session %s: the Cognee server's LLM budget "
+                    "is exhausted (402); not retrying" % session_id
+                )
+            else:
+                _log("improve failed for session %s: %s" % (session_id, exc))
         except Exception as exc:
             _log("improve failed for session %s: %s" % (session_id, exc))
     if wait_for_parent:
