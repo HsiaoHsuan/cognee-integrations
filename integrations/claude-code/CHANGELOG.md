@@ -67,6 +67,13 @@ project adheres to [Semantic Versioning](https://semver.org/).
 - Merged upstream 1.7.1 into the fork. The fork changes from 1.6.6-fork.1
   through 1.6.6-fork.6 are kept on top of it.
 
+### Fixed
+- **A self-hosted Cognee behind a Cloudflare Worker refused every hook call.**
+  Cloudflare answers `Python-urllib/*` with error 1010 on `*.workers.dev`. Every
+  request a plugin process makes now sends `cognee-memory-plugin/<version>`,
+  including through a global opener another call cached before the patch loaded.
+  A header the caller sets on its own request still wins.
+
 ## [1.7.1]
 
 ### Fixed
